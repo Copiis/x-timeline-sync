@@ -3,15 +3,29 @@
 Userscript zur präzisen Speicherung und Wiederherstellung der Leseposition auf X.com (Twitter).
 
 **Original Author:** Copiis  
-**Refactoring Status:** Phase 1 + Phase 2 angewendet (Work in Progress)
+**Refactoring Status:** Phase 1 + Phase 2 weitgehend abgeschlossen
 
-## Aktueller Stand
+## Aktueller Stand (Mai 2026)
 
-- Phase 1: Magic Numbers → CONFIG, tote Grants bereinigt
-- Phase 2: Zentrale `isRepost()` + `parsePost()` extrahiert (Duplikation entfernt)
+- Phase 1: CONFIG-Objekt mit allen Magic Numbers, Header aufgeräumt
+- Phase 2: Zentrale `isRepost()` + `parsePost()` hinzugefügt
+- Alle Aufrufe von `isPostRepost(...)` auf die neue zentrale Funktion umgestellt
+- Duplizierte Repost-Erkennungs-Funktionen entfernt (5 Kopien eliminiert)
 
-Weitere Phasen folgen.
+**Wichtiger Hinweis:** Die Kern-Suchlogik (`startRefinedSearchForLastReadPost` etc.) wurde bewusst noch nicht stark verändert, um Stabilität zu gewährleisten.
 
-## Repository
+Nächste geplante Schritte: Bessere State-Kapselung und Vereinfachung der Suchlogik.
 
-https://github.com/Copiis/x-timeline-sync
+## Installation
+
+1. Tampermonkey oder Violentmonkey installieren
+2. `Twitter-X-Timeline-Sync.user.js` als Userscript laden
+
+## Lizenz
+
+MIT
+
+## Spenden (Original)
+
+- Bitcoin: bc1quc5mkudlwwkktzhvzw5u2nruxyepef957p68r7
+- PayPal: https://www.paypal.com/paypalme/Coopiis
