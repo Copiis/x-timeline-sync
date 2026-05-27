@@ -1,1 +1,12 @@
-**The content from earlier**
+# OS
+.DS_Store
+Thumbs.db
+
+# Editor
+.vscode/
+.idea/
+
+# Local only
+*.bak
+*.orig
+notes.txt
