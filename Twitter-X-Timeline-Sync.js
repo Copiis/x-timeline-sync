@@ -14,7 +14,7 @@
 // @description:ko Twitter/X에서 마지막 읽기 위치를 추적하고 동기화합니다. 수동 및 자동 옵션 포함. 새로운 게시물을 확인하면서 현재 위치를 잃지 않도록 이상적입니다. 트윗 ID를 사용하여 정확한 위치 지정을 하고, 리포스트를 지원합니다。
 // @icon https://x.com/favicon.ico
 // @namespace https://github.com/Copiis/x-timeline-sync
-// @version 2026.6.24a
+// @version 2026.6.24c
 // @author Copiis
 // @license MIT
 // @match https://x.com/*
@@ -1184,11 +1184,7 @@
             if (isNearTimelineTop()) {
                 const newPostsIndicator = getNewPostsIndicator();
                 if (newPostsIndicator && !newPostsIndicator.dataset.processed) {
-                    searchControl.isSearching = true;
-                    clickNewPostsIndicator(newPostsIndicator);
-                    suppressionState.until = Date.now() + CONFIG.NEW_POSTS_GRACE_MS;
-                    // Hinweis: clickNewPostsIndicator selbst kümmert sich um waitForNewPosts + Restore.
-                    // Die waitForNewPosts hier würde zu doppelten Restore-Aufrufen führen → entfernt.
+                    clickNewPostsIndicator();
                 }
             }
             markTopVisiblePost(true);
@@ -1209,9 +1205,7 @@
                 // Erster sofortiger Check
                 const immediateIndicator = getNewPostsIndicator();
                 if (immediateIndicator && !immediateIndicator.dataset.processed) {
-                    searchControl.isSearching = true;
-                    clickNewPostsIndicator(immediateIndicator);
-                    suppressionState.until = Date.now() + CONFIG.NEW_POSTS_GRACE_MS;
+                    clickNewPostsIndicator();
                     return;
                 }
 
@@ -1222,10 +1216,7 @@
                     setTimeout(() => {
                         const newPostsIndicator = getNewPostsIndicator();
                         if (newPostsIndicator && !newPostsIndicator.dataset.processed) {
-                            searchControl.isSearching = true;
-                            clickNewPostsIndicator(newPostsIndicator);
-                            suppressionState.until = Date.now() + CONFIG.NEW_POSTS_GRACE_MS;
-                            // waitForNewPosts + exakte Restore-Logik wird jetzt zentral von clickNewPostsIndicator übernommen (vermeidet Doppel-Starts von waitForNewPosts).
+                            clickNewPostsIndicator();
                         } else {
                             checkNewPostsOnFocus(attempt + 1);
                         }
@@ -1253,9 +1244,7 @@
                 // Erster sofortiger Check (keine Verzögerung)
                 const indicatorImmediate = getNewPostsIndicator();
                 if (indicatorImmediate && !indicatorImmediate.dataset.processed) {
-                    searchControl.isSearching = true;
-                    clickNewPostsIndicator(indicatorImmediate);
-                    suppressionState.until = Date.now() + CONFIG.NEW_POSTS_GRACE_MS;
+                    clickNewPostsIndicator();
                     return;
                 }
 
@@ -1266,9 +1255,7 @@
                     setTimeout(() => {
                         const indicator = getNewPostsIndicator();
                         if (indicator && !indicator.dataset.processed) {
-                            searchControl.isSearching = true;
-                            clickNewPostsIndicator(indicator);
-                            suppressionState.until = Date.now() + CONFIG.NEW_POSTS_GRACE_MS;
+                            clickNewPostsIndicator();
                         } else {
                             checkOnVisibility(attempt + 1);
                         }
@@ -1283,11 +1270,7 @@
             if (!isScriptActivated || searchControl.isSearching || searchControl.isFallbackSearching || searchControl.isAutoScrolling || !isNearTimelineTop()) return;
             const newPostsIndicator = getNewPostsIndicator();
             if (newPostsIndicator && !newPostsIndicator.dataset.processed) {
-                searchControl.isSearching = true;
-                clickNewPostsIndicator(newPostsIndicator);
-                suppressionState.until = Date.now() + CONFIG.NEW_POSTS_GRACE_MS;
-                // Hinweis: waitForNewPosts + Restore-Logik wird zentral in clickNewPostsIndicator gehandhabt.
-                // Doppelte waitFor-Aufrufe wurden entfernt, um doppeltes "Neue Beiträge laden" + doppelte Restore-Suchen zu vermeiden.
+                clickNewPostsIndicator();
             }
         }, 3000);
 
@@ -1418,11 +1401,16 @@
 
     window.addEventListener('load', initializeWhenDOMReady);
 
+    function clearHighlightFromPost(postElement) {
+        if (!postElement) return;
+        postElement.style.removeProperty('box-shadow');
+        postElement.style.removeProperty('outline');
+    }
+
     function applyHighlightToPost(postElement) {
         if (!postElement || !postElement.isConnected) return false;
         if (lastHighlightedPost && lastHighlightedPost !== postElement) {
-            lastHighlightedPost.style.boxShadow = 'none';
-            lastHighlightedPost.style.outline = 'none';
+            clearHighlightFromPost(lastHighlightedPost);
         }
         const glow = '0 0 20px 10px rgba(246, 146, 25, 0.9)';
         postElement.style.setProperty('box-shadow', glow, 'important');
@@ -1699,11 +1687,7 @@
         });
 
         if (savedElement) {
-            if (lastHighlightedPost && lastHighlightedPost !== savedElement) {
-                lastHighlightedPost.style.boxShadow = 'none';
-            }
-            savedElement.style.boxShadow = '0 0 20px 10px rgba(246, 146, 25, 0.9)';
-            lastHighlightedPost = savedElement;
+            applyHighlightToPost(savedElement);
         }
     }
     } catch (err) {
@@ -1782,9 +1766,7 @@
             const newPostsIndicator = getNewPostsIndicator();
             if (newPostsIndicator && !newPostsIndicator.dataset.processed) {
                 log('NewPosts', 'Neue Beiträge über Intervall erkannt und sichtbar.');
-                searchControl.isSearching = true;
-                clickNewPostsIndicator(newPostsIndicator);
-                // waitForNewPosts zentral in clickNewPostsIndicator
+                clickNewPostsIndicator();
             }
         }, 3000);
         window.addEventListener('unload', () => clearInterval(interval));
@@ -2815,8 +2797,8 @@
         const indicator = getNewPostsIndicator();
         if (indicator) {
             if (isNearTimelineTop()) {
-                log('NewPosts', 'Indicator erkannt – Auto-Click in 600ms');
-                setTimeout(clickNewPostsIndicator, 600);
+                log('NewPosts', 'Indicator erkannt – Auto-Click in 600ms (nach Lesestellen-Prüfung)');
+                setTimeout(() => { clickNewPostsIndicator(); }, 600);
             } else {
                 debugLog('NewPosts', 'Indicator gesehen bei scrollY=' + Math.round(window.scrollY) + ' – ignoriert (nicht nah am Top, kein Auto-Laden).');
             }
@@ -2902,14 +2884,79 @@
     return null;
 }
 
-    function clickNewPostsIndicator() {
+    async function ensureViewportLesestelleBeforeNewPosts() {
+        if (!window.location.href.includes('/home')) return true;
+
+        const topPost = getTopVisiblePost();
+        if (!topPost) {
+            log('NewPosts', 'Kein Post im Viewport – Neue Beiträge zurückgestellt');
+            return false;
+        }
+
+        const tweetId = getPostTweetId(topPost);
+        const authorHandler = getPostAuthorHandler(topPost);
+        const timestamp = getPostTimestamp(topPost);
+        const repostFlag = isRepost(topPost);
+
+        if (!tweetId || !authorHandler || !timestamp) {
+            log('NewPosts', 'Top-Post im Viewport unvollständig – Neue Beiträge zurückgestellt');
+            return false;
+        }
+
+        const matchesCurrent = lastReadPost &&
+            lastReadPost.tweetId === tweetId &&
+            lastReadPost.authorHandler === authorHandler &&
+            !!lastReadPost.isRepost === repostFlag;
+
+        if (matchesCurrent) {
+            debugLog('NewPosts', `Lesestelle = Top-Post (@${authorHandler} ${tweetId})`);
+            return true;
+        }
+
+        log('NewPosts', `Lesestelle weicht ab – setze @${authorHandler} ${tweetId} vor Neue-Beiträge`);
+
+        suppressionState.until = 0;
+        suppressionState.pastTweetId = null;
+        await markTopVisiblePost(true);
+
+        const matchesAfterMark = lastReadPost &&
+            lastReadPost.tweetId === tweetId &&
+            lastReadPost.authorHandler === authorHandler &&
+            !!lastReadPost.isRepost === repostFlag;
+
+        if (!matchesAfterMark) {
+            const account = await getCurrentUserHandle();
+            lastReadPost = {
+                tweetId,
+                authorHandler,
+                timestamp,
+                isRepost: repostFlag,
+                account,
+                readAt: new Date().toISOString()
+            };
+            await saveLastReadPost(lastReadPost);
+            log('Save', 'Lesestelle vor New-Posts synchronisiert: @' + authorHandler, tweetId);
+        }
+
+        return true;
+    }
+
+    async function clickNewPostsIndicator() {
+
+    const ready = await ensureViewportLesestelleBeforeNewPosts();
+    if (!ready) {
+        searchControl.isSearching = false;
+        return;
+    }
 
     const btn = getNewPostsIndicator();
     if (!btn) {
         debugLog('NewPosts', 'Kein Button gefunden');
+        searchControl.isSearching = false;
         return;
     }
 
+    searchControl.isSearching = true;
     btn.dataset.processed = 'true';
     btn.click();
 
@@ -2920,8 +2967,6 @@
 
     // === Wichtiger Pfad: Nach automatischem Laden neuer Beiträge die letzte Lesestelle wiederherstellen ===
     if (lastReadPost && lastReadPost.tweetId) {
-        searchControl.isSearching = true;
-
         log('Restore', 'Nach neuen Beiträgen: Warte auf DOM-Stabilisierung und versuche letzte Lesestelle wiederherzustellen...');
 
         waitForNewPosts(() => {
