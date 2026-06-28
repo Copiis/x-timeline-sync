@@ -14,15 +14,15 @@
 // @description:ko Twitter/X에서 마지막 읽기 위치를 추적하고 동기화합니다. 수동 및 자동 옵션 포함. 새로운 게시물을 확인하면서 현재 위치를 잃지 않도록 이상적입니다. 트윗 ID를 사용하여 정확한 위치 지정을 하고, 리포스트를 지원합니다。
 // @icon https://x.com/favicon.ico
 // @namespace https://github.com/Copiis/x-timeline-sync
-// @version 2026.6.24c
+// @version 2026.6.28b
 // @author Copiis
 // @license MIT
 // @match https://x.com/*
 // @grant GM_setValue
 // @grant GM_getValue
 // @grant GM_registerMenuCommand
-// @downloadURL https://raw.githubusercontent.com/Copiis/x-timeline-sync/master/Twitter-X-Timeline-Sync.user.js
-// @updateURL https://raw.githubusercontent.com/Copiis/x-timeline-sync/master/Twitter-X-Timeline-Sync.user.js
+// @downloadURL https://raw.githubusercontent.com/Copiis/x-timeline-sync/master/Twitter-X-Timeline-Sync.js
+// @updateURL https://raw.githubusercontent.com/Copiis/x-timeline-sync/master/Twitter-X-Timeline-Sync.js
 // @description If you find this script useful and would like to support my work, consider making a small donation!
 // @description GitHub Sponsors: https://github.com/sponsors/Copiis
 // ==/UserScript==
@@ -39,6 +39,10 @@
         // === Such- & Scroll-Limits ===
         MAX_SCROLL_ATTEMPTS: 150,
         MAX_LOADED_POSTS_BEFORE_FALLBACK: 1500,
+        // Erweiterte Limits, solange noch keine historischen Landkarten-Posts im DOM sind
+        MAP_ANCHOR_SEARCH_MAX_ATTEMPTS: 800,
+        MAP_ANCHOR_SEARCH_MAX_LOADED: 6000,
+        MAP_ANCHOR_SEARCH_MAX_STAGNANT: 120,
         MAX_STAGNANT_SCROLLS: 35,
         MAX_FALLBACK_ATTEMPTS: 35,
         MAX_POSITION_ATTEMPTS: 6,
@@ -57,11 +61,17 @@
 
         // === Unterdrückungszeiten nach Restore / Neuen Posts (Punkt 3 vereinfacht) ===
         RESTORE_GRACE_MS: 1200,              // Kurzer harter Mindestschutz nach manuellem Restore (früher 3.5s+)
+        POST_LUPE_NEWER_BLOCK_MS: 5000,      // Nach Lupe: keine automatische Lesestellen-Vorwärts-Sprünge
         NEW_POSTS_GRACE_MS: 1800,            // Nach "Neue Beiträge" (etwas länger wegen Feed-Sprung)
+        NEW_POSTS_SCROLL_SEARCH_MAX_ATTEMPTS: 60,
+        NEW_POSTS_SCROLL_STEP_PX: 520,
+        NEW_POSTS_SCROLL_SETTLE_MS: 280,
+        NEW_POSTS_SCROLL_STAGNANT_LOADS: 3,    // Keine neuen articles mehr im DOM
+        NEW_POSTS_SCROLL_STAGNANT_HEIGHT: 2,   // scrollHeight unverändert
 
-        // === Positionierung beim Wiederherstellen ===
-        READING_POSITION_TOP_OFFSET: 5,      // Ab welchem Abstand von oben ein Post als neue Lesestelle gespeichert wird (5px unter Oberkante)
-        RESTORE_SCROLL_OFFSET: 50,           // Ziel: obere Kante des Posts 50px unter Viewport-Oberkante (Zentrierung beim Wiederherstellen)
+        // === Positionierung ===
+        READING_POSITION_TOP_OFFSET: 5,      // Oberster sichtbarer Post ab 5px unter Viewport-Oberkante (Lesestelle)
+        RESTORE_SCROLL_OFFSET: 175,          // Ziel: obere Kante des Posts 175px unter Viewport-Oberkante (Lupe/Restore/New-Posts)
         POSITION_CORRECTION_TOLERANCE: 35,   // Toleranz in scrollToPostWithHighlight
         FALLBACK_POSITION_TOLERANCE: 40,     // Toleranz in findAndSetClosestPost Feinjustierung
 
@@ -71,6 +81,21 @@
         // === Such-Verhalten (Balance zwischen Geschwindigkeit bei weit entfernten Zielen und Overshoot-Schutz) ===
         MAX_SEARCH_DISTANCE_FACTOR: 3.2,     // Etwas höher als früher, damit weit entfernte Lesestellen schneller erreicht werden
         MAX_SEARCH_STEP_VH: 3.8,             // Deutlich größere Sprünge erlaubt für weit entfernte Lesestellen (vorher zu konservativ)
+        SLOW_SEARCH_FINE_STEP_PX: 120,       // Kleine Schritte wenn Ziel-idx bereits im Viewport (Ping-Pong-Schutz)
+        SLOW_SEARCH_FINE_MAX_ATTEMPTS: 10,   // Danach Top-Retry + sicheres Resolve
+        SEARCH_FINE_ZONE_HYSTERESIS: 2,      // Abstand 0–2: keine großen Sprünge mehr (Ping-Pong-Schutz)
+        SEARCH_TOP_RETRY_MAX_IDX: 25,        // Nahe Top: einmal scrollY=0 vor Fallback
+
+        // === Context-Match (Phase 2) ===
+        CONTEXT_NEIGHBOR_COUNT: 5,
+        CONTEXT_MATCH_MIN_SCORE: 25,
+        MASS_INFLUX_PENDING_THRESHOLD: 8,
+
+        // === Timeline-Landkarte (steuert Lesestelle = oberster Post nach Map-Update) ===
+        MAX_TIMELINE_MAP: 2500,
+        TIMELINE_MAP_DEBOUNCE_MS: 200,
+        TIMELINE_MAP_PERSIST_MS: 30000,
+        MAP_SCROLL_DIRECTION_THRESHOLD: 40,
     };
 
     const repostCache = new WeakMap();
@@ -205,10 +230,10 @@
         const account = repostData.account || 'unknown';
         const key = REPOST_LOG_KEY(account);
 
-        let log = GM_getValue(key, []);
+        let repostLogEntries = GM_getValue(key, []);
 
         // Deduplication
-        const isDuplicate = log.some(entry => 
+        const isDuplicate = repostLogEntries.some(entry => 
             entry.reposter === repostData.reposter &&
             entry.originalAuthor === repostData.originalAuthor &&
             Math.abs(new Date(entry.repostDate).getTime() - new Date(repostData.repostDate).getTime()) < 1000 * 60 * 60 * 24
@@ -219,20 +244,20 @@
             return;
         }
 
-        log.push({
+        repostLogEntries.push({
             reposter: repostData.reposter,
             originalAuthor: repostData.originalAuthor,
             repostDate: repostData.repostDate,
             discoveredAt: repostData.discoveredAt || new Date().toISOString()
         });
 
-        if (log.length > MAX_REPOST_LOG) {
-            log = log.slice(-MAX_REPOST_LOG);
+        if (repostLogEntries.length > MAX_REPOST_LOG) {
+            repostLogEntries = repostLogEntries.slice(-MAX_REPOST_LOG);
         }
 
-        GM_setValue(key, log);
+        GM_setValue(key, repostLogEntries);
         log('Repost', `Repost erfasst: @${repostData.reposter} → @${repostData.originalAuthor}`);
-        debugLog('Repost', 'Total reposts logged for account', account, '=', log.length);
+        debugLog('Repost', 'Total reposts logged for account', account, '=', repostLogEntries.length);
     }
 
     function parsePost(postElement) {
@@ -274,7 +299,9 @@
             disabled: "disabled",
             fallbackSearchCancelled: "ℹ️ Fallback search cancelled.",
             redirectToHome: "ℹ️ Redirecting to home to search for reading position.",
-            saveError: "❌ Save failed after retries. Data may be lost."
+            saveError: "❌ Save failed after retries. Data may be lost.",
+            approximatePosition: "ℹ️ Approximate reading position restored ({strategy}).",
+            feedStronglyChanged: "ℹ️ Feed changed significantly — landed at best guess."
         },
         de: {
             noValidPosition: "❌ Keine gültige Leseposition zum Downloaden.",
@@ -302,7 +329,9 @@
             disabled: "deaktiviert",
             fallbackSearchCancelled: "ℹ️ Fallback-Suche abgebrochen.",
             redirectToHome: "ℹ️ Weiterleitung zur Startseite, um die Leseposition zu suchen.",
-            saveError: "❌ Speichern fehlgeschlagen nach Wiederholungen. Daten könnten verloren gehen."
+            saveError: "❌ Speichern fehlgeschlagen nach Wiederholungen. Daten könnten verloren gehen.",
+            approximatePosition: "ℹ️ Ungefähre Leseposition wiederhergestellt ({strategy}).",
+            feedStronglyChanged: "ℹ️ Feed stark verändert — beste Schätzung gesetzt."
         },
 
         es: {
@@ -689,6 +718,139 @@
     }
 
     // ============================================================
+    // Diagnostic Logging — strukturierte Logs für Fehleranalyse (AI + User)
+    //
+    // Severity: info (console.log) | warn/anomaly (console.warn) | error (console.error)
+    // Codes: FLOW_*, BOOKMARK_*, RESTORE_*, SEARCH_*, GUARD_*
+    // Bei Problemen: nach [Diag:ERROR] oder [Diag:WARN] filtern, dann [Diag:SESSION]
+    // ============================================================
+
+    const DIAG = {
+        enabled: true,
+        flowCounter: 0,
+        activeFlow: null,
+        sessionAnomalies: [],
+        maxSessionAnomalies: 40,
+    };
+
+    function diagBookmark(bm) {
+        if (!bm?.tweetId) return null;
+        return {
+            id: String(bm.tweetId),
+            author: bm.authorHandler || '?',
+            repost: !!bm.isRepost,
+            label: `@${bm.authorHandler || '?'} ${bm.tweetId}${bm.isRepost ? ' (Repost)' : ''}`,
+        };
+    }
+
+    function diagSnapshot(extra = {}) {
+        return {
+            scrollY: Math.round(window.scrollY),
+            articles: document.querySelectorAll('article').length,
+            bookmark: diagBookmark(lastReadPost)?.label || '(keins)',
+            flags: {
+                manualSearch: searchControl.manualSearchActive,
+                newPostsRestore: searchControl.newPostsRestoreActive,
+                isSearching: searchControl.isSearching,
+                isFallback: searchControl.isFallbackSearching,
+            },
+            activeFlow: DIAG.activeFlow?.name || null,
+            flowId: DIAG.activeFlow?.id || null,
+            timelineMap: timelineMapOrderedKeys.length,
+            ...extra,
+        };
+    }
+
+    function diagPush(code, severity, message, context = {}) {
+        if (!DIAG.enabled) return;
+        const entry = {
+            code,
+            severity,
+            message,
+            flow: DIAG.activeFlow?.name || null,
+            flowId: DIAG.activeFlow?.id || null,
+            ...context,
+        };
+        if (severity !== 'info') {
+            DIAG.sessionAnomalies.push(entry);
+            if (DIAG.sessionAnomalies.length > DIAG.maxSessionAnomalies) {
+                DIAG.sessionAnomalies.shift();
+            }
+        }
+        const prefix = `[Diag:${severity.toUpperCase()}]`;
+        const line = { code, msg: message, ...context };
+        if (severity === 'error') {
+            console.error(prefix, line);
+        } else if (severity === 'warn' || severity === 'anomaly') {
+            console.warn(prefix, line);
+        } else {
+            console.log(prefix, line);
+        }
+    }
+
+    function diagBeginFlow(name, context = {}) {
+        DIAG.flowCounter += 1;
+        DIAG.activeFlow = { id: DIAG.flowCounter, name, started: Date.now() };
+        diagPush('FLOW_START', 'info', `▶ ${name} #${DIAG.flowCounter}`, {
+            snapshot: diagSnapshot(context),
+        });
+        return DIAG.flowCounter;
+    }
+
+    function diagEndFlow(outcome, code, message, context = {}) {
+        const flow = DIAG.activeFlow;
+        if (!flow) return;
+        const ms = Date.now() - flow.started;
+        const severity = outcome === 'ok' ? 'info' : outcome === 'warn' ? 'warn' : 'error';
+        const icon = outcome === 'ok' ? '✓' : outcome === 'warn' ? '⚠' : '✗';
+        diagPush(code, severity, `${icon} ${flow.name} #${flow.id} (${ms}ms): ${message}`, {
+            snapshot: diagSnapshot(context),
+            durationMs: ms,
+        });
+        if (severity !== 'info') {
+            const recent = DIAG.sessionAnomalies
+                .filter(a => a.severity === 'warn' || a.severity === 'error' || a.severity === 'anomaly')
+                .slice(-6)
+                .map(a => `${a.code}: ${a.message}`);
+            if (recent.length > 0) {
+                console.warn('[Diag:SESSION] Letzte Anomalien:', recent);
+            }
+        }
+        DIAG.activeFlow = null;
+    }
+
+    function diagBlocked(code, message, extra = {}) {
+        diagPush(code, 'warn', `BLOCKED — ${message}`, { snapshot: diagSnapshot(extra) });
+    }
+
+    function diagVerifyLanding(expectedBookmark, resolved, source) {
+        if (!expectedBookmark?.tweetId || !resolved?.post?.tweetId) return true;
+        const idMatch = String(expectedBookmark.tweetId) === String(resolved.post.tweetId);
+        const authorMatch = expectedBookmark.authorHandler === resolved.post.authorHandler;
+        const repostMatch = !!expectedBookmark.isRepost === !!resolved.post.isRepost;
+        if (idMatch && authorMatch && repostMatch) {
+            diagPush('LANDING_OK', 'info', `Landing korrekt (${source})`, {
+                expected: diagBookmark(expectedBookmark),
+                strategy: resolved.strategy,
+                confidence: resolved.confidence,
+            });
+            return true;
+        }
+        diagPush('RESTORE_TARGET_MISMATCH', 'error',
+            `Landing auf falschem Post (${source}) — erwartet vs. tatsächlich`, {
+                expected: diagBookmark(expectedBookmark),
+                actual: diagBookmark(resolved.post),
+                strategy: resolved.strategy,
+                confidence: resolved.confidence,
+                idMatch,
+                authorMatch,
+                repostMatch,
+                snapshot: diagSnapshot(),
+            });
+        return false;
+    }
+
+    // ============================================================
     // Globale State-Variablen (Punkt 4 - gruppiert mit kleinen Objekten)
     //
     // Vorteil: Logisch zusammengehörige Variablen sind jetzt gebündelt.
@@ -719,6 +881,18 @@
         // Neue Regel (User-Wunsch): Reposts dürfen nur als Lesestelle gespeichert werden,
         // wenn der User vorher aktiv nach oben gescrollt hat.
         hasScrolledUp: false,
+        programmaticScrollEndedAt: 0,
+        lastMapScrollY: 0,
+        lastMapScrollDirection: 'neutral',
+        mapSnapshotAtSearchStart: null,
+        mapSnapshotOrderedKeys: null,
+        mapSnapshotTweetIdToIdx: null,
+        mapSnapshotBookmarkKey: null,
+        mapSnapshotBookmarkIdx: -1,
+        searchCoarseDirection: null,
+        slowScrollLockedDirection: null,
+        slowScrollFineAttempts: 0,
+        searchTopRetryDone: false,
     };
 
     // === Search Control Flags ===
@@ -727,17 +901,85 @@
         isFallbackSearching: false,
         isSearchCancelled: false,
         isAutoScrolling: false,
+        manualSearchActive: false,
+        newPostsRestoreActive: false,
+        lastManualSearchEndedAt: 0,
     };
+
+    const newPostsState = {
+        autoLoadPaused: false,
+        lastPausedLogAt: 0,
+        lastLesestelleLogKey: null,
+        lastRestoreCompletedAt: 0,
+    };
+
+    function snapshotReadingBookmark(bookmark = lastReadPost) {
+        if (!bookmark?.tweetId || !bookmark?.authorHandler || !bookmark?.timestamp) {
+            return null;
+        }
+        return {
+            tweetId: bookmark.tweetId,
+            authorHandler: bookmark.authorHandler,
+            timestamp: bookmark.timestamp,
+            isRepost: !!bookmark.isRepost,
+            readAt: bookmark.readAt || bookmark.timestamp,
+            account: bookmark.account,
+            context: bookmark.context
+        };
+    }
+
+    function beginManualSearchSession() {
+        searchControl.manualSearchActive = true;
+        searchControl.isSearching = true;
+        searchControl.isSearchCancelled = false;
+    }
+
+    function endManualSearchSession(clearSearching = true) {
+        searchControl.manualSearchActive = false;
+        searchControl.lastManualSearchEndedAt = Date.now();
+        if (clearSearching) {
+            searchControl.isSearching = false;
+        }
+        flushDeferredTimelineMapUpdate('search-end');
+    }
+
+    function isPostLupeProtectionActive() {
+        return suppressionState.blockNewerAdoptionUntil > Date.now() ||
+            (searchControl.lastManualSearchEndedAt > 0 &&
+                Date.now() - searchControl.lastManualSearchEndedAt < CONFIG.POST_LUPE_NEWER_BLOCK_MS);
+    }
 
     // === Suppression / Restore Protection (Punkt 3) ===
     const suppressionState = {
         until: 0,
         pastTweetId: null,
+        blockNewerAdoptionUntil: 0,
     };
 
     // === Core Position & Highlight ===
     let lastReadPost = null;
     let lastHighlightedPost = null;
+    let highlightRetryGeneration = 0;
+
+    function invalidateHighlightRetries() {
+        highlightRetryGeneration++;
+    }
+
+    function isScrollAnchorStale(anchorTweetId, anchorAuthor = null) {
+        if (!lastReadPost?.tweetId || !anchorTweetId) return false;
+        if (anchorTweetId !== lastReadPost.tweetId) return true;
+        if (anchorAuthor && lastReadPost.authorHandler && anchorAuthor !== lastReadPost.authorHandler) {
+            return true;
+        }
+        return false;
+    }
+
+    function syncHighlightIfDrifted() {
+        if (!lastReadPost?.tweetId || !lastReadPost.authorHandler) return;
+        const expected = findPostElementInDOM(lastReadPost.tweetId, lastReadPost.authorHandler);
+        if (!expected || lastHighlightedPost === expected) return;
+        updateHighlightedPost();
+    }
 
     // === UI / Activation Control ===
     let isScriptActivated = false;
@@ -797,6 +1039,14 @@
 
     // Cache für History (wird bei Saves aktualisiert für schnellen Abgleich)
     let postHistoryCache = [];
+
+    // Timeline-Landkarte: Feed-Reihenfolge (oben→unten), fortlaufend aktualisiert
+    let timelineMapOrderedKeys = [];
+    const timelineMapByKey = new Map();
+    let timelineMapAccount = null;
+    let timelineMapLastPersist = 0;
+    let timelineMapUpdateTimer = null;
+    let timelineMapPendingSource = 'unknown';
 
     // Schnelles Gedächtnis: Alle bereits markierten Positionen (tweetId + Repost-Flag)
     // Wird aus der History befüllt. Ein Post/RePost wird nur dann als neue Lesestelle übernommen,
@@ -879,6 +1129,8 @@
 
         postHistoryCache = history; // Cache aktualisieren für schnellen Timeline-Abgleich
         rebuildKnownMarkedKeys();
+        timelineMapAccount = postData.account;
+        scheduleTimelineMapUpdate('save', 'neutral');
 
         debugLog('Save', `Position + Historie gespeichert (${history.length}/${MAX_POST_HISTORY} Einträge)`);
 
@@ -1053,6 +1305,7 @@
             GM_setValue(historyKey, filteredHistory);
             postHistoryCache = filteredHistory; // Cache für Gedächtnis/Abgleich füllen
             rebuildKnownMarkedKeys();
+            loadTimelineMapForAccount(account);
             debugLog('Load', `Post-Historie: ${filteredHistory.length} Einträge (letzte 7 Tage).`);
             callback(position);
         } else {
@@ -1175,20 +1428,28 @@
                 return;
             }
 
-            // Neue Repost-Regel: Nach oben scrollen erkennen
-            if (window.scrollY < lastScrollY - 40) {
+            let mapScrollDir = 'neutral';
+            if (window.scrollY < lastScrollY - CONFIG.MAP_SCROLL_DIRECTION_THRESHOLD) {
                 scrollState.hasScrolledUp = true;
+                mapScrollDir = 'up';
+                scrollState.lastMapScrollDirection = 'up';
+            } else if (window.scrollY > lastScrollY + CONFIG.MAP_SCROLL_DIRECTION_THRESHOLD) {
+                mapScrollDir = 'down';
+                scrollState.lastMapScrollDirection = 'down';
             }
             lastScrollY = window.scrollY;
+            scrollState.lastMapScrollY = window.scrollY;
 
-            if (isNearTimelineTop()) {
-                const newPostsIndicator = getNewPostsIndicator();
-                if (newPostsIndicator && !newPostsIndicator.dataset.processed) {
-                    clickNewPostsIndicator();
-                }
+            if (!isNearTimelineTop()) {
+                newPostsState.autoLoadPaused = false;
+            } else {
+                tryAutoClickNewPosts();
             }
-            markTopVisiblePost(true);
+            markTopVisiblePost(true, false, mapScrollDir);
         }, 150), { passive: true });
+
+        setupTimelineMapObserver();
+        window.addEventListener('beforeunload', () => persistTimelineMap(true));
 
         window.addEventListener('focus', () => {
             if (!isScriptActivated || searchControl.isSearching || searchControl.isFallbackSearching || searchControl.isAutoScrolling) {
@@ -1202,22 +1463,19 @@
                     observeForNewPosts();
                 }
 
-                // Erster sofortiger Check
-                const immediateIndicator = getNewPostsIndicator();
-                if (immediateIndicator && !immediateIndicator.dataset.processed) {
-                    clickNewPostsIndicator();
+                if (isNewPostsAutoLoadPaused()) {
                     return;
                 }
 
+                tryAutoClickNewPosts();
+
                 // Mehrere schnelle Checks, weil der "New Posts"-Button oft erst beim Fokussieren gerendert wird
                 const checkNewPostsOnFocus = (attempt = 0) => {
-                    if (attempt > 8) return;
+                    if (attempt > 8 || isNewPostsAutoLoadPaused()) return;
 
                     setTimeout(() => {
-                        const newPostsIndicator = getNewPostsIndicator();
-                        if (newPostsIndicator && !newPostsIndicator.dataset.processed) {
-                            clickNewPostsIndicator();
-                        } else {
+                        tryAutoClickNewPosts();
+                        if (!isNewPostsAutoLoadPaused()) {
                             checkNewPostsOnFocus(attempt + 1);
                         }
                     }, 300 + (attempt * 130));
@@ -1241,22 +1499,19 @@
                     observeForNewPosts();
                 }
 
-                // Erster sofortiger Check (keine Verzögerung)
-                const indicatorImmediate = getNewPostsIndicator();
-                if (indicatorImmediate && !indicatorImmediate.dataset.processed) {
-                    clickNewPostsIndicator();
+                if (isNewPostsAutoLoadPaused()) {
                     return;
                 }
 
+                tryAutoClickNewPosts();
+
                 // Mehrere schnelle Versuche, weil der New-Posts-Button oft erst beim Sichtbar-Werden gerendert wird
                 const checkOnVisibility = (attempt = 0) => {
-                    if (attempt > 8) return;
+                    if (attempt > 8 || isNewPostsAutoLoadPaused()) return;
 
                     setTimeout(() => {
-                        const indicator = getNewPostsIndicator();
-                        if (indicator && !indicator.dataset.processed) {
-                            clickNewPostsIndicator();
-                        } else {
+                        tryAutoClickNewPosts();
+                        if (!isNewPostsAutoLoadPaused()) {
                             checkOnVisibility(attempt + 1);
                         }
                     }, 280 + (attempt * 110));
@@ -1267,11 +1522,7 @@
         });
 
         const checkNewPostsInterval = setInterval(() => {
-            if (!isScriptActivated || searchControl.isSearching || searchControl.isFallbackSearching || searchControl.isAutoScrolling || !isNearTimelineTop()) return;
-            const newPostsIndicator = getNewPostsIndicator();
-            if (newPostsIndicator && !newPostsIndicator.dataset.processed) {
-                clickNewPostsIndicator();
-            }
+            tryAutoClickNewPosts();
         }, 3000);
 
         window.addEventListener('unload', () => clearInterval(checkNewPostsInterval));
@@ -1363,7 +1614,8 @@
         return;
     }
 
-    log('Init', 'Initialisiere Skript auf /home...');
+    log('Init', 'Initialisiere Skript auf /home... (Version 2026.6.28b)');
+    log('Init', 'Diag-Logging aktiv — bei Problemen Konsole filtern: Diag:ERROR | Diag:WARN | Diag:SESSION');
 
     const observer = new MutationObserver((mutations, obs) => {
         if (document.body) {
@@ -1405,16 +1657,24 @@
         if (!postElement) return;
         postElement.style.removeProperty('box-shadow');
         postElement.style.removeProperty('outline');
+        postElement.style.removeProperty('outline-style');
+        postElement.style.removeProperty('outline-color');
     }
 
-    function applyHighlightToPost(postElement) {
+    function applyHighlightToPost(postElement, options = {}) {
         if (!postElement || !postElement.isConnected) return false;
+        const { confidence = 100, strategy = 'exact' } = options;
+
         if (lastHighlightedPost && lastHighlightedPost !== postElement) {
             clearHighlightFromPost(lastHighlightedPost);
         }
-        const glow = '0 0 20px 10px rgba(246, 146, 25, 0.9)';
-        postElement.style.setProperty('box-shadow', glow, 'important');
-        postElement.style.setProperty('outline', '3px solid rgba(246, 146, 25, 0.95)', 'important');
+
+        const outlineColor = confidence < 40 || strategy === 'emergency'
+            ? 'rgba(255, 107, 107, 0.9)'
+            : 'rgba(246, 146, 25, 0.95)';
+
+        postElement.style.setProperty('box-shadow', 'none', 'important');
+        postElement.style.setProperty('outline', `1px solid ${outlineColor}`, 'important');
         lastHighlightedPost = postElement;
         return true;
     }
@@ -1427,8 +1687,15 @@
     }
 
     function scheduleHighlightRetries(tweetId, authorHandler, delays = [0, 300, 900, 2000]) {
+        const gen = ++highlightRetryGeneration;
         delays.forEach(delay => {
             setTimeout(() => {
+                if (gen !== highlightRetryGeneration) return;
+                if (isScrollAnchorStale(tweetId, authorHandler)) {
+                    syncHighlightIfDrifted();
+                    debugLog('Highlight', `Retry nach ${delay}ms verworfen — Lesestelle hat sich geändert`);
+                    return;
+                }
                 const el = findPostElementInDOM(tweetId, authorHandler);
                 if (el) {
                     applyHighlightToPost(el);
@@ -1447,7 +1714,7 @@
             )
             : null;
         if (freshPreferred && applyHighlightToPost(freshPreferred)) {
-            debugLog('Highlight', 'Glühender Rand auf bevorzugtes Element gesetzt');
+            debugLog('Highlight', 'Rand (1px) auf bevorzugtes Element gesetzt');
             return;
         }
 
@@ -1458,7 +1725,7 @@
         const lastReadElement = findPostElementInDOM(lastReadPost.tweetId, lastReadPost.authorHandler);
         if (lastReadElement) {
             applyHighlightToPost(lastReadElement);
-            debugLog('Highlight', 'Glühender Rand auf Leseposition gesetzt');
+            debugLog('Highlight', 'Rand (1px) auf Leseposition gesetzt');
         } else if (lastHighlightedPost && lastHighlightedPost.isConnected) {
             debugLog('Highlight', 'Leseposition nicht per ID im DOM, behalte aktuellen Rahmen');
         } else {
@@ -1488,7 +1755,8 @@
             timestamp,
             isRepost: repostFlag,
             readAt: repostFlag ? new Date().toISOString() : undefined,
-            adoptedFromFallback: true
+            adoptedFromFallback: true,
+            context: captureReadingContext(postElement)
         };
         if (repostFlag && !lastReadPost.readAt) {
             lastReadPost.readAt = lastReadPost.timestamp;
@@ -1509,15 +1777,30 @@
         // Kurzer harter Grace + ID für frühe Aufhebung beim Weiterscrollen
         suppressionState.until = Date.now() + CONFIG.RESTORE_GRACE_MS;
         suppressionState.pastTweetId = tweetId || null;
+        suppressionState.blockNewerAdoptionUntil = Date.now() + CONFIG.POST_LUPE_NEWER_BLOCK_MS;
         scrollState.hasScrolledUp = false; // Nach Restore/ manueller Suche kein "Hochscrollen" mehr annehmen
         debugLog('Restore', `Grace ${CONFIG.RESTORE_GRACE_MS}ms aktiviert für ${tweetId}`);
     }
 
-    async function markTopVisiblePost(save = true, allowOlderRegression = false) {
+    async function markTopVisiblePost(save = true, allowOlderRegression = false, mapDirection = null) {
     try {
 
-    if (!window.location.href.includes('/home') || searchControl.isSearching || searchControl.isFallbackSearching) {
+    if (!window.location.href.includes('/home') || searchControl.isSearching || searchControl.isFallbackSearching || searchControl.manualSearchActive) {
         return;
+    }
+
+    if (searchControl.lastManualSearchEndedAt > 0 &&
+        Date.now() - searchControl.lastManualSearchEndedAt < CONFIG.POST_LUPE_NEWER_BLOCK_MS) {
+        debugLog('Save', 'Auto-Save unterdrückt (nach Lupe-Suche / Scrollbalken-Nachlauf)');
+        return;
+    }
+
+    const dir = mapDirection || scrollState.lastMapScrollDirection || 'neutral';
+    refreshMapForLesestelle('mark', dir);
+
+    if (dir === 'up' || scrollState.hasScrolledUp) {
+        const promoted = await tryPromoteNewerVisiblePostOnScrollUp(dir);
+        if (promoted) return;
     }
 
     // Wichtiger Gedächtnis-Schritt: Timeline mit History abgleichen
@@ -1533,19 +1816,17 @@
             // Harter kurzer Grace-Timer läuft noch
             suppress = true;
         } else if (suppressionState.pastTweetId) {
-            // Grace abgelaufen, aber wir haben noch eine "wiederhergestellte" ID
-            const currentTop = getTopVisiblePost();
-            if (currentTop) {
-                const currentId = getPostTweetId(currentTop);
+            // Grace abgelaufen — oberster Post (Landkarte) vs. Lupe-Ziel prüfen
+            const readingPost = getTopVisiblePost();
+            if (readingPost) {
+                const currentId = getPostTweetId(readingPost);
                 if (currentId && BigInt(currentId) <= BigInt(suppressionState.pastTweetId)) {
-                    // User ist noch bei oder oberhalb der wiederhergestellten Position → weiter schützen
                     suppress = true;
                 } else {
-                    // User hat zu einem neueren Post gescrollt → sofort freigeben
-                    suppressionState.until = 0;
-                    suppressionState.pastTweetId = null;
-                    debugLog('Restore', 'Grace frühzeitig aufgehoben (User hat zu neuerem Post gescrollt)');
+                    suppress = isPostLupeProtectionActive();
                 }
+            } else {
+                suppress = true;
             }
         }
 
@@ -1562,13 +1843,19 @@
         debugLog('Restore', 'Grace abgelaufen — normale Auto-Speicherung wieder aktiv');
     }
 
-    const topPost = getTopVisiblePost();
-    if (!topPost) return;
+    if (save && scrollState.programmaticScrollEndedAt > 0 &&
+        Date.now() - scrollState.programmaticScrollEndedAt < 2500) {
+        save = false;
+        debugLog('Restore', 'Auto-Save unterdrückt (nach programmatischem Scroll)');
+    }
 
-    const postTweetId = getPostTweetId(topPost);
-    const postTimestamp = getPostTimestamp(topPost);
-    const postAuthorHandler = getPostAuthorHandler(topPost);
-    const repostFlag = isRepost(topPost);
+    const anchorPost = getLesestelleAnchorPost();
+    if (!anchorPost) return;
+
+    const postTweetId = getPostTweetId(anchorPost);
+    const postTimestamp = getPostTimestamp(anchorPost);
+    const postAuthorHandler = getPostAuthorHandler(anchorPost);
+    const repostFlag = isRepost(anchorPost);
 
     // === Starker History-Gedächtnis-Check (User-Wunsch) ===
     // Ein Post/RePost darf **nur** dann als neue Lesestelle gesetzt werden,
@@ -1577,9 +1864,33 @@
     const positionKey = `${postTweetId}-${repostFlag}`;
 
     if (knownMarkedKeys.has(positionKey) && !allowOlderRegression) {
+        if (lastReadPost?.tweetId && postTweetId && postAuthorHandler && postTimestamp) {
+            try {
+                if (BigInt(postTweetId) > BigInt(lastReadPost.tweetId)) {
+                    if (isPostLupeProtectionActive()) {
+                        debugLog('Restore', 'GM-Sync übersprungen — Post-Lupe-Schutz aktiv');
+                        return;
+                    }
+                    const account = await getCurrentUserHandle();
+                    lastReadPost = {
+                        tweetId: postTweetId,
+                        timestamp: postTimestamp,
+                        authorHandler: postAuthorHandler,
+                        isRepost: repostFlag,
+                        account,
+                        readAt: new Date().toISOString()
+                    };
+                    await saveLastReadPost(lastReadPost, { force: true });
+                    updateHighlightedPost();
+                    debugLog('Save', `GM-Sync: bekannter Post ${positionKey} ist neuer — Lesestelle aktualisiert`);
+                    return;
+                }
+            } catch (e) {
+                debugLog('Save', 'GM-Sync ID-Vergleich fehlgeschlagen:', e);
+            }
+        }
         debugLog('Save', `Bereits in History bekannt (${positionKey}) – Lesestelle wird nicht neu gesetzt (Gedächtnis)`);
-        // Harter Skip für die gesamte Lesestellen-Logik bei bekannten Positionen.
-        // Reconcile wird für diesen Durchlauf deaktiviert, um keine alten History-Einträge zurückzuholen.
+        syncHighlightIfDrifted();
         return;
     }
 
@@ -1589,7 +1900,7 @@
     //  der Punkt-3-Cleanup-Phase auftrat; siehe log.txt 30.05.2026)
     try {
         if (repostFlag && postAuthorHandler) {
-            const reposter = getReposterHandler(topPost);
+            const reposter = getReposterHandler(anchorPost);
             const account = await getCurrentUserHandle();
 
             debugLog('Repost', 'markTopVisiblePost repostFlag=true, author=', postAuthorHandler, 'reposter=', reposter);
@@ -1633,7 +1944,8 @@
             authorHandler: postAuthorHandler,
             isRepost: repostFlag,
             account,
-            readAt: nowIso
+            readAt: nowIso,
+            context: captureReadingContext(anchorPost)
         };
 
         let shouldUpdate = true;
@@ -1696,65 +2008,83 @@
     }
 }
 
-    function waitForNewPosts(callback) {
+    function waitForNewPosts(callback, options = {}) {
     const timelineContainer = document.querySelector("div[data-testid='primaryColumn']") || document.body;
+    const initialPostCount = options.baselinePostCount ?? document.querySelectorAll('article').length;
+    const initialCellCount = options.baselineCellCount ?? document.querySelectorAll("div[data-testid='cellInnerDiv']").length;
+    const initialScrollHeight = options.baselineScrollHeight ??
+        (document.body.scrollHeight || document.documentElement.scrollHeight);
+    const settleMs = options.settleMs ?? 1600;
+    const fallbackMs = options.fallbackMs ?? 3200;
+    const aggressiveScroll = options.aggressiveScroll ?? false;
+
     let loadAttempts = 0;
-    const maxLoadAttempts = 80;
-    const initialPostCount = document.querySelectorAll('article').length;
-    const initialCellCount = document.querySelectorAll("div[data-testid='cellInnerDiv']").length;
+    const maxLoadAttempts = aggressiveScroll ? 80 : 12;
     let callbackTriggered = false;
-    const observer = new MutationObserver((mutations) => {
-        if (callbackTriggered || searchControl.isSearchCancelled) return;
+    let observer = null;
+    let timeoutCheck = null;
+    let fallbackTimer = null;
+
+    const hasNewDomContent = () => {
         const currentPostCount = document.querySelectorAll('article').length;
         const currentCellCount = document.querySelectorAll("div[data-testid='cellInnerDiv']").length;
-        if (currentPostCount > initialPostCount || currentCellCount > initialCellCount) {
-            log('NewPosts', 'Neue Beiträge oder Zellen im DOM erkannt, starte Suche.');
-            callbackTriggered = true;
-            observer.disconnect();
-            setTimeout(() => {
-                callback();
-            }, 1600); // etwas mehr Zeit für stabileres Layout nach neuen Posts (verhindert zu frühe Sprünge)
-        }
+        const currentScrollHeight = document.body.scrollHeight || document.documentElement.scrollHeight;
+        return currentPostCount > initialPostCount
+            || currentCellCount > initialCellCount
+            || currentScrollHeight > initialScrollHeight + 30;
+    };
+
+    const triggerCallback = (reason) => {
+        if (callbackTriggered || searchControl.isSearchCancelled) return;
+        callbackTriggered = true;
+        if (observer) observer.disconnect();
+        if (timeoutCheck) clearInterval(timeoutCheck);
+        if (fallbackTimer) clearTimeout(fallbackTimer);
+        debugLog('NewPosts', `Restore-Trigger: ${reason}`);
+        setTimeout(() => {
+            callback();
+        }, settleMs);
+    };
+
+    observer = new MutationObserver(() => {
+        if (!hasNewDomContent()) return;
+        log('NewPosts', 'Neue Beiträge oder Zellen im DOM erkannt, starte Suche.');
+        triggerCallback('mutation');
     });
     observer.observe(timelineContainer, {
         childList: true,
         subtree: true,
         attributes: false
     });
-    const timeoutCheck = setInterval(() => {
+
+    timeoutCheck = setInterval(() => {
         loadAttempts++;
-        const currentPostCount = document.querySelectorAll('article').length;
-        const currentCellCount = document.querySelectorAll('div[data-testid="cellInnerDiv"]').length;
         if (callbackTriggered || searchControl.isSearchCancelled) {
             clearInterval(timeoutCheck);
             return;
         }
-        if (currentPostCount > initialPostCount || currentCellCount > initialCellCount) {
-            log('NewPosts', 'Neue Beiträge über Timeout erkannt, starte Suche.');
-            callbackTriggered = true;
-            observer.disconnect();
-            clearInterval(timeoutCheck);
-            setTimeout(() => {
-                callback();
-            }, 1600); // etwas mehr Zeit für stabileres Layout nach neuen Posts
+        if (hasNewDomContent()) {
+            log('NewPosts', 'Neue Beiträge über Polling erkannt, starte Suche.');
+            triggerCallback('poll');
         } else if (loadAttempts >= maxLoadAttempts) {
-            log('NewPosts', 'Keine neuen Posts nach max Versuchen – starte mit aktuellen Posts.');
-            callbackTriggered = true;
-            observer.disconnect();
-            clearInterval(timeoutCheck);
-            setTimeout(() => {
-                callback();
-            }, 1600); // etwas mehr Zeit für stabileres Layout
-        } else {
-            const currentScrollHeight = document.body.scrollHeight || document.documentElement.scrollHeight;
-            const viewportHeight = window.innerHeight;
-            const scrollStep = viewportHeight * 0.6;
+            log('NewPosts', 'Keine DOM-Änderung erkannt – Restore mit aktuellem Feed.');
+            triggerCallback('timeout');
+        } else if (aggressiveScroll) {
+            const scrollStep = window.innerHeight * 0.6;
             window.scrollBy({ top: scrollStep, behavior: 'smooth' });
         }
     }, 1000);
+
+    fallbackTimer = setTimeout(() => {
+        if (callbackTriggered || searchControl.isSearchCancelled) return;
+        log('NewPosts', 'Fallback-Restore (DOM bereits beim Klick aktualisiert).');
+        triggerCallback('fallback');
+    }, fallbackMs);
+
     window.addEventListener('unload', () => {
-        observer.disconnect();
-        clearInterval(timeoutCheck);
+        if (observer) observer.disconnect();
+        if (timeoutCheck) clearInterval(timeoutCheck);
+        if (fallbackTimer) clearTimeout(fallbackTimer);
         searchControl.isSearching = false;
         searchControl.isFallbackSearching = false;
     }, { once: true });
@@ -1762,12 +2092,7 @@
 
     function startNewPostsCheckInterval() {
         const interval = setInterval(() => {
-            if (!isScriptActivated || searchControl.isSearching || searchControl.isFallbackSearching || searchControl.isAutoScrolling || !isNearTimelineTop()) return;
-            const newPostsIndicator = getNewPostsIndicator();
-            if (newPostsIndicator && !newPostsIndicator.dataset.processed) {
-                log('NewPosts', 'Neue Beiträge über Intervall erkannt und sichtbar.');
-                clickNewPostsIndicator();
-            }
+            tryAutoClickNewPosts();
         }, 3000);
         window.addEventListener('unload', () => clearInterval(interval));
     }
@@ -1809,6 +2134,110 @@
   }
   return topPost;
 }
+
+    function findNewestVisiblePostNewerThanBookmark(bookmark) {
+        if (!bookmark?.tweetId) return null;
+
+        let bookmarkId;
+        try {
+            bookmarkId = BigInt(bookmark.tweetId);
+        } catch (e) {
+            return null;
+        }
+
+        const vh = window.innerHeight || document.documentElement.clientHeight;
+        let best = null;
+        let bestId = bookmarkId;
+
+        for (const post of document.querySelectorAll("article[data-testid='tweet']")) {
+            const rect = post.getBoundingClientRect();
+            if (rect.height < 5 || rect.bottom <= 0 || rect.top >= vh) continue;
+
+            const parsed = parseLoadedPost(post);
+            if (!parsed?.tweetId) continue;
+            try {
+                if (parsed.bigId > bestId) {
+                    bestId = parsed.bigId;
+                    best = parsed;
+                }
+            } catch (e) {
+                continue;
+            }
+        }
+
+        return best;
+    }
+
+    /**
+     * Beim Hochscrollen: neueren sichtbaren Post oberhalb der Lesestelle sofort markieren.
+     * Umgeht Map/Reconcile-Verzögerung nach New-Posts-Restore (stale lastScrollY, Option-2-Skip).
+     */
+    async function tryPromoteNewerVisiblePostOnScrollUp(mapDirection) {
+        if (mapDirection !== 'up' && !scrollState.hasScrolledUp) return false;
+        if (!lastReadPost?.tweetId) return false;
+
+        const newer = findNewestVisiblePostNewerThanBookmark(lastReadPost);
+        if (!newer?.tweetId || !newer.authorHandler || !newer.timestamp) return false;
+
+        try {
+            if (BigInt(newer.tweetId) <= BigInt(lastReadPost.tweetId)) return false;
+        } catch (e) {
+            return false;
+        }
+
+        const account = await getCurrentUserHandle();
+        const nowIso = new Date().toISOString();
+        const newPost = {
+            tweetId: newer.tweetId,
+            timestamp: newer.timestamp,
+            authorHandler: newer.authorHandler,
+            isRepost: newer.isRepost,
+            account,
+            readAt: nowIso,
+            context: captureReadingContext(newer.element)
+        };
+
+        invalidateHighlightRetries();
+        lastReadPost = newPost;
+        currentPost = newPost;
+        await saveLastReadPost(lastReadPost, { force: true });
+        updateHighlightedPost(newer.element);
+        applyHighlightToPost(newer.element);
+        log('Save', 'Hochscrollen: neuerer Post über Lesestelle markiert: @' + newer.authorHandler, newer.tweetId);
+        scrollState.hasScrolledUp = false;
+        return true;
+    }
+
+    /**
+     * Post an der Lesestellen-Linie (RESTORE_SCROLL_OFFSET, default 175px).
+     * Wichtig: getTopVisiblePost() liefert den obersten Post (ab ~5px) — nach Lupe/Restore
+     * stehen dort oft neuere Posts ÜBER der echten Lesestelle und triggern falsche Saves.
+     */
+    function getPostAtReadingOffset(maxDeviation = 120) {
+        const posts = document.querySelectorAll("article[data-testid='tweet']");
+        const vh = window.innerHeight || document.documentElement.clientHeight;
+        const target = CONFIG.RESTORE_SCROLL_OFFSET;
+        let best = null;
+        let bestDev = Infinity;
+
+        for (const post of posts) {
+            const rect = post.getBoundingClientRect();
+            if (rect.height < 5) continue;
+            if (rect.bottom <= 0 || rect.top >= vh) continue;
+
+            const dev = Math.abs(rect.top - target);
+            if (dev < bestDev) {
+                bestDev = dev;
+                best = post;
+            }
+        }
+
+        return best && bestDev <= maxDeviation ? best : null;
+    }
+
+    function getLesestelleAnchorPost() {
+        return getTopPostFromUpdatedMap();
+    }
 
     function getPostTweetId(post) {
         const linkElement = post.querySelector("a[role='link'][href*='/status/']");
@@ -1980,6 +2409,15 @@
     }));
 }
 
+    function getNewestHistoryEntry() {
+        if (!postHistoryCache.length) return null;
+        return postHistoryCache.reduce((best, entry) => {
+            if (!entry?.tweetId) return best;
+            if (!best) return entry;
+            return isCandidateNewer(entry, best) ? entry : best;
+        }, null);
+    }
+
     function rebuildKnownMarkedKeys() {
         knownMarkedKeys.clear();
         postHistoryCache.forEach(entry => {
@@ -2015,8 +2453,50 @@
             });
 
             if (exactPositionStillVisible) {
+                if (scrollState.hasScrolledUp || scrollState.lastMapScrollDirection === 'up') {
+                    const newerParsed = findNewestVisiblePostNewerThanBookmark(lastReadPost);
+                    if (newerParsed?.tweetId && newerParsed.authorHandler && newerParsed.timestamp) {
+                        try {
+                            if (BigInt(newerParsed.tweetId) > BigInt(lastReadPost.tweetId)) {
+                                lastReadPost = {
+                                    tweetId: newerParsed.tweetId,
+                                    timestamp: newerParsed.timestamp,
+                                    authorHandler: newerParsed.authorHandler,
+                                    isRepost: newerParsed.isRepost,
+                                    account: lastReadPost.account,
+                                    readAt: new Date().toISOString()
+                                };
+                                updateHighlightedPost(newerParsed.element);
+                                void saveLastReadPost(lastReadPost, { force: true });
+                                debugLog('Save', 'Gedächtnis-Abgleich: Neuerer Post beim Hochscrollen über Lesestelle');
+                                return;
+                            }
+                        } catch (e) {
+                            debugLog('Save', 'Hochscroll-Reconcile ID-Vergleich fehlgeschlagen:', e);
+                        }
+                    }
+                }
                 debugLog('Save', 'Reconcile übersprungen: Exakte aktuelle Lesestelle ist noch sichtbar (Option 2 Präferenz)');
+                syncHighlightIfDrifted();
                 return; // Nicht korrigieren, solange die echte aktuelle Position noch im Viewport ist
+            }
+
+            // Oben in der Timeline: neuester History-Eintrag hat Vorrang (verhindert GM-Drift)
+            if (isNearTimelineTop()) {
+                const newestHist = getNewestHistoryEntry();
+                if (newestHist?.tweetId) {
+                    const newestKey = `${newestHist.tweetId}-${!!newestHist.isRepost}`;
+                    const newestVisible = visible.some(p =>
+                        `${p.tweetId}-${!!p.isRepost}` === newestKey
+                    );
+                    if (newestVisible && isCandidateNewer(newestHist, lastReadPost)) {
+                        lastReadPost = { ...newestHist };
+                        updateHighlightedPost();
+                        void saveLastReadPost(lastReadPost, { force: true });
+                        debugLog('Save', 'Gedächtnis-Abgleich: Neuester History-Eintrag oben im Feed (GM-Sync)');
+                        return;
+                    }
+                }
             }
 
             // History als schnelle Lookup-Map aufbauen (getrennt nach Typ für bessere Treffer)
@@ -2056,6 +2536,1711 @@
         }
     }
 
+    // ============================================================
+    // Timeline-Landkarte — Feed-Reihenfolge-Gedächtnis
+    // ============================================================
+
+    const TIMELINE_MAP_KEY = (account) => `timelineMap_${account}`;
+
+    function getPostDomY(parsed) {
+        return parsed.element.getBoundingClientRect().top + window.scrollY;
+    }
+
+    function sortPostsByDomY(posts) {
+        return [...posts].sort((a, b) => getPostDomY(a) - getPostDomY(b));
+    }
+
+    function loadTimelineMapForAccount(account, force = false) {
+        if (!force && timelineMapAccount === account && timelineMapOrderedKeys.length > 0) {
+            debugLog('Map', `Live-Landkarte beibehalten (${timelineMapOrderedKeys.length} Einträge)`);
+            return;
+        }
+
+        timelineMapAccount = account;
+        timelineMapOrderedKeys = [];
+        timelineMapByKey.clear();
+        timelineMapLastPersist = 0;
+
+        const stored = GM_getValue(TIMELINE_MAP_KEY(account), null);
+        if (!stored) return;
+
+        try {
+            const data = typeof stored === 'string' ? JSON.parse(stored) : stored;
+            const sevenDaysAgo = Date.now() - CONFIG.SEVEN_DAYS_IN_MS;
+            const entries = data.entries || {};
+            const ordered = Array.isArray(data.orderedKeys) ? data.orderedKeys : [];
+            const filteredOrder = [];
+
+            for (const key of ordered) {
+                const entry = entries[key];
+                if (!entry?.tweetId) continue;
+                const seenAt = new Date(entry.lastSeenAt || 0).getTime();
+                if (seenAt <= sevenDaysAgo) continue;
+                filteredOrder.push(key);
+                timelineMapByKey.set(key, { ...entry, inDom: false });
+            }
+
+            timelineMapOrderedKeys = filteredOrder.slice(-CONFIG.MAX_TIMELINE_MAP);
+            const orderSet = new Set(timelineMapOrderedKeys);
+            for (const key of [...timelineMapByKey.keys()]) {
+                if (!orderSet.has(key)) timelineMapByKey.delete(key);
+            }
+
+            debugLog('Map', `Landkarte geladen: ${timelineMapOrderedKeys.length} Einträge`);
+        } catch (e) {
+            log('Map', 'Fehler beim Laden der Landkarte:', e);
+        }
+    }
+
+    function persistTimelineMap(force = false) {
+        if (!timelineMapAccount) return;
+        const now = Date.now();
+        if (!force && now - timelineMapLastPersist < CONFIG.TIMELINE_MAP_PERSIST_MS) return;
+
+        const entries = {};
+        for (const key of timelineMapOrderedKeys) {
+            const entry = timelineMapByKey.get(key);
+            if (entry) entries[key] = entry;
+        }
+
+        GM_setValue(TIMELINE_MAP_KEY(timelineMapAccount), JSON.stringify({
+            orderedKeys: timelineMapOrderedKeys,
+            entries,
+            savedAt: new Date().toISOString()
+        }));
+        timelineMapLastPersist = now;
+    }
+
+    function trimTimelineMap() {
+        const sevenDaysAgo = Date.now() - CONFIG.SEVEN_DAYS_IN_MS;
+        const kept = [];
+
+        for (const key of timelineMapOrderedKeys) {
+            const entry = timelineMapByKey.get(key);
+            if (!entry) continue;
+            const seenAt = new Date(entry.lastSeenAt || 0).getTime();
+            if (seenAt <= sevenDaysAgo) {
+                timelineMapByKey.delete(key);
+                continue;
+            }
+            kept.push(key);
+        }
+
+        if (kept.length > CONFIG.MAX_TIMELINE_MAP) {
+            const removed = kept.splice(0, kept.length - CONFIG.MAX_TIMELINE_MAP);
+            for (const key of removed) timelineMapByKey.delete(key);
+        }
+
+        timelineMapOrderedKeys = kept;
+    }
+
+    function mergeNewDomChunk(oldOrder, domKeys) {
+        const domSet = new Set(domKeys);
+        const ghosts = oldOrder.filter(k => !domSet.has(k));
+
+        if (!domKeys.length) return ghosts;
+        if (!ghosts.length) return [...domKeys];
+
+        const firstDom = timelineMapByKey.get(domKeys[0]);
+        const firstGhost = timelineMapByKey.get(ghosts[0]);
+
+        if (firstDom && firstGhost) {
+            try {
+                if (BigInt(firstDom.tweetId) > BigInt(firstGhost.tweetId)) {
+                    return [...domKeys, ...ghosts];
+                }
+            } catch (e) {
+                debugLog('Map', 'mergeNewDomChunk ID-Vergleich fehlgeschlagen:', e);
+            }
+        }
+
+        return [...ghosts, ...domKeys];
+    }
+
+    function mergeDomOrderIntoMap(oldOrder, domKeys) {
+        const domSet = new Set(domKeys);
+        if (!oldOrder.length) return [...domKeys];
+        if (!domKeys.length) return oldOrder.filter(k => timelineMapByKey.has(k));
+
+        const firstDomIdx = oldOrder.findIndex(k => domSet.has(k));
+        if (firstDomIdx < 0) return mergeNewDomChunk(oldOrder, domKeys);
+
+        const before = oldOrder.slice(0, firstDomIdx).filter(k => !domSet.has(k));
+        const after = oldOrder.slice(firstDomIdx).filter(k => !domSet.has(k));
+
+        return [...before, ...domKeys, ...after];
+    }
+
+    function normalizeMapDirection(direction, source) {
+        if (direction === 'up' || direction === 'down') return direction;
+        if (source === 'mutation' || source === 'save' || source === 'search-init' || source === 'mark') {
+            return 'neutral';
+        }
+        if (source.startsWith('search')) {
+            if (scrollState.searchDirection === 'up') return 'up';
+            if (scrollState.searchDirection === 'down') return 'down';
+        }
+        if (scrollState.lastMapScrollDirection === 'up' || scrollState.lastMapScrollDirection === 'down') {
+            return scrollState.lastMapScrollDirection;
+        }
+        return 'neutral';
+    }
+
+    /**
+     * Richtungsabhängiges Merge:
+     * up   → neuere Posts oben einfügen / Top-Segment aktualisieren
+     * down → ältere Posts unten anfügen
+     * neutral → vollständiger DOM-Abgleich (Suche-Init, Mutation)
+     */
+    function mergeDirectional(oldOrder, domKeys, direction) {
+        const oldSet = new Set(oldOrder);
+        if (!oldOrder.length) return domKeys;
+        if (!domKeys.length) return oldOrder.filter(k => timelineMapByKey.has(k));
+        if (direction === 'neutral') return mergeDomOrderIntoMap(oldOrder, domKeys);
+
+        if (direction === 'up') {
+            const anchorIdx = domKeys.findIndex(k => oldSet.has(k));
+            if (anchorIdx < 0) {
+                const prepend = domKeys.filter(k => !oldSet.has(k));
+                return [...prepend, ...oldOrder];
+            }
+            if (anchorIdx === 0) {
+                let topRun = 0;
+                while (topRun < domKeys.length && oldSet.has(domKeys[topRun])) topRun++;
+                if (topRun > 1) {
+                    const newTop = domKeys.slice(0, topRun);
+                    const rest = oldOrder.filter(k => !newTop.includes(k));
+                    return [...newTop, ...rest];
+                }
+            }
+            const prepend = domKeys.slice(0, anchorIdx);
+            const rest = oldOrder.filter(k => !prepend.includes(k));
+            return [...prepend, ...rest];
+        }
+
+        if (direction === 'down') {
+            let anchorIdx = -1;
+            for (let i = domKeys.length - 1; i >= 0; i--) {
+                if (oldSet.has(domKeys[i])) {
+                    anchorIdx = i;
+                    break;
+                }
+            }
+            if (anchorIdx < 0) {
+                const append = domKeys.filter(k => !oldSet.has(k));
+                return [...oldOrder, ...append];
+            }
+            const append = domKeys.slice(anchorIdx + 1).filter(k => !oldSet.has(k));
+            return [...oldOrder, ...append];
+        }
+
+        return mergeDomOrderIntoMap(oldOrder, domKeys);
+    }
+
+    function scheduleTimelineMapUpdate(source = 'unknown', direction = 'neutral') {
+        if (shouldDeferTimelineMapUpdate()) {
+            timelineMapDirtyWhileDeferred = true;
+            timelineMapPendingSource = source;
+            timelineMapPendingDirection = direction;
+            return;
+        }
+
+        timelineMapPendingSource = source;
+        timelineMapPendingDirection = direction;
+        if (timelineMapUpdateTimer) return;
+
+        timelineMapUpdateTimer = setTimeout(() => {
+            timelineMapUpdateTimer = null;
+            updateTimelineMap(timelineMapPendingSource, timelineMapPendingDirection);
+        }, CONFIG.TIMELINE_MAP_DEBOUNCE_MS);
+    }
+
+    let timelineMapPendingDirection = 'neutral';
+    let timelineMapDirtyWhileDeferred = false;
+
+    function shouldDeferTimelineMapUpdate() {
+        if (searchControl.newPostsRestoreActive) return true;
+        if (searchControl.isFallbackSearching) return true;
+        // Lupe: erst nach eingefrorenem Snapshot pausieren (search-init + Snapshot bleiben möglich)
+        if (searchControl.isSearching && scrollState.mapSnapshotOrderedKeys?.length) return true;
+        return false;
+    }
+
+    function flushDeferredTimelineMapUpdate(source = 'deferred-flush') {
+        if (!timelineMapDirtyWhileDeferred) return;
+        timelineMapDirtyWhileDeferred = false;
+        if (timelineMapUpdateTimer) {
+            clearTimeout(timelineMapUpdateTimer);
+            timelineMapUpdateTimer = null;
+        }
+        const src = timelineMapPendingSource || source;
+        const dir = timelineMapPendingDirection || 'neutral';
+        updateTimelineMap(src, dir, true);
+    }
+
+    function updateTimelineMap(source = 'unknown', explicitDirection = 'neutral', force = false) {
+        if (!force && shouldDeferTimelineMapUpdate()) {
+            timelineMapDirtyWhileDeferred = true;
+            timelineMapPendingSource = source;
+            timelineMapPendingDirection = explicitDirection;
+            return;
+        }
+
+        if (!window.location.href.includes('/home')) return;
+
+        const all = getAllLoadedPostsParsed();
+        if (!all.length) return;
+
+        const direction = normalizeMapDirection(explicitDirection, source);
+        const domSorted = sortPostsByDomY(all);
+        const domKeys = [];
+        const domKeySet = new Set();
+        const now = Date.now();
+        const nowIso = new Date(now).toISOString();
+        const previousDomOrder = timelineMapOrderedKeys.filter(k => timelineMapByKey.get(k)?.inDom);
+        let reorderCount = 0;
+
+        for (const parsed of domSorted) {
+            const ref = compactPostRef(parsed);
+            const key = postRefKey(ref);
+            if (!key || domKeySet.has(key)) continue;
+
+            domKeySet.add(key);
+            domKeys.push(key);
+
+            const domY = getPostDomY(parsed);
+            const existing = timelineMapByKey.get(key);
+            const newDomIndex = domKeys.length - 1;
+            const oldDomIndex = previousDomOrder.indexOf(key);
+
+            if (oldDomIndex >= 0 && oldDomIndex !== newDomIndex) {
+                reorderCount++;
+            }
+
+            if (existing) {
+                existing.lastDomY = domY;
+                existing.lastSeenAt = nowIso;
+                existing.inDom = true;
+            } else {
+                timelineMapByKey.set(key, {
+                    key,
+                    tweetId: ref.tweetId,
+                    authorHandler: ref.authorHandler,
+                    isRepost: ref.isRepost,
+                    timestamp: ref.timestamp,
+                    lastDomY: domY,
+                    lastSeenAt: nowIso,
+                    inDom: true
+                });
+            }
+        }
+
+        for (const key of timelineMapByKey.keys()) {
+            if (!domKeySet.has(key)) {
+                const entry = timelineMapByKey.get(key);
+                if (entry) entry.inDom = false;
+            }
+        }
+
+        const previousSize = timelineMapOrderedKeys.length;
+        timelineMapOrderedKeys = mergeDirectional(timelineMapOrderedKeys, domKeys, direction);
+        trimTimelineMap();
+
+        if (reorderCount > 0) {
+            diagPush('MAP_REORDER', 'info', `${reorderCount} Post(s) in Landkarte umsortiert`, {
+                source,
+                direction,
+                reorderCount,
+                mapSize: timelineMapOrderedKeys.length,
+            });
+        }
+
+        const added = timelineMapOrderedKeys.length - previousSize;
+        if (added > 0 || reorderCount > 0) {
+            debugLog('Map', `Update (${source}, ${direction}): ${timelineMapOrderedKeys.length} Einträge, +${Math.max(0, added)} neu, ${reorderCount} umsortiert`);
+        }
+
+        persistTimelineMap();
+    }
+
+    function setupTimelineMapObserver() {
+        const container = document.querySelector("div[data-testid='primaryColumn']");
+        if (!container) {
+            setTimeout(setupTimelineMapObserver, 500);
+            return;
+        }
+
+        const observer = new MutationObserver(() => {
+            scheduleTimelineMapUpdate('mutation', 'neutral');
+        });
+        observer.observe(container, { childList: true, subtree: true });
+        debugLog('Map', 'Timeline-Landkarten-Observer aktiv');
+    }
+
+    function isPostNewerThanBookmark(post, bookmark) {
+        if (!post?.tweetId || !bookmark?.tweetId) return false;
+        try {
+            return BigInt(post.tweetId) > BigInt(bookmark.tweetId);
+        } catch (e) {
+            return false;
+        }
+    }
+
+    function findNextOlderPostInMap(bookmark, all) {
+        if (!bookmark?.tweetId || !all?.length || timelineMapOrderedKeys.length === 0) return null;
+
+        const domByKey = new Map();
+        for (const parsed of all) {
+            const key = postRefKey(parsed);
+            if (key) domByKey.set(key, parsed);
+        }
+
+        let startIdx = findBookmarkIndexInMap(bookmark);
+        if (startIdx < 0) return null;
+
+        let bookmarkId = null;
+        try {
+            bookmarkId = BigInt(bookmark.tweetId);
+        } catch (e) {
+            bookmarkId = null;
+        }
+
+        // Map-Index 0 = neuesten Feed-Position; höhere Indizes = ältere Posts
+        for (let i = startIdx + 1; i < timelineMapOrderedKeys.length; i++) {
+            const key = timelineMapOrderedKeys[i];
+            const parsed = domByKey.get(key);
+            if (!parsed) continue;
+
+            if (bookmarkId !== null) {
+                try {
+                    if (parsed.bigId >= bookmarkId) {
+                        debugLog('Resolve', `Map-Nachfolger @${parsed.authorHandler} ${parsed.tweetId} ist nicht älter — übersprungen`);
+                        continue;
+                    }
+                } catch (e) {
+                    continue;
+                }
+            }
+
+            const entry = timelineMapByKey.get(key);
+            return {
+                post: parsed,
+                confidence: 92,
+                strategy: 'older',
+                reason: `map-successor (@${entry?.authorHandler || parsed.authorHandler} ${parsed.tweetId})`
+            };
+        }
+
+        return null;
+    }
+
+    function findBookmarkIndexInMap(bookmark) {
+        if (!bookmark?.tweetId || !timelineMapOrderedKeys.length) return -1;
+
+        const bookmarkKey = postRefKey(bookmark);
+        if (!bookmarkKey) return -1;
+
+        let idx = timelineMapOrderedKeys.indexOf(bookmarkKey);
+        if (idx >= 0) return idx;
+
+        try {
+            const bookmarkId = BigInt(bookmark.tweetId);
+            for (let i = 0; i < timelineMapOrderedKeys.length; i++) {
+                const entry = timelineMapByKey.get(timelineMapOrderedKeys[i]);
+                if (!entry?.tweetId) continue;
+                try {
+                    if (BigInt(entry.tweetId) === bookmarkId && !!entry.isRepost === !!bookmark.isRepost) {
+                        return i;
+                    }
+                } catch (e) {
+                    continue;
+                }
+            }
+        } catch (e) {
+            return -1;
+        }
+
+        const computedIdx = computeBookmarkIdxInOrderedKeys(timelineMapOrderedKeys, bookmark);
+        if (computedIdx >= 0 && computedIdx < timelineMapOrderedKeys.length) {
+            return computedIdx;
+        }
+
+        return -1;
+    }
+
+    function refreshMapForLesestelle(source = 'mark', direction = 'neutral') {
+        updateTimelineMap(source, direction);
+    }
+
+    /**
+     * Oberster Post laut aktualisierter Landkarte:
+     * unter sichtbaren Posts der mit dem niedrigsten Map-Index (neuesten Feed-Position).
+     */
+    function getTopPostFromUpdatedMap() {
+        if (!timelineMapOrderedKeys.length) {
+            return getTopVisiblePost();
+        }
+
+        const visible = getVisiblePosts();
+        let bestEl = null;
+        let bestMapIdx = Infinity;
+
+        for (const vis of visible) {
+            if (!vis?.tweetId) continue;
+            const idx = findBookmarkIndexInMap(vis);
+            if (idx >= 0 && idx < bestMapIdx) {
+                bestMapIdx = idx;
+                bestEl = vis.element;
+            }
+        }
+
+        if (bestEl) return bestEl;
+
+        for (const key of timelineMapOrderedKeys) {
+            const entry = timelineMapByKey.get(key);
+            if (!entry?.inDom) continue;
+            const el = findPostElementInDOM(entry.tweetId, entry.authorHandler);
+            if (el) return el;
+        }
+
+        return getTopVisiblePost();
+    }
+
+    function findInsertIndexFromHistory(bookmark) {
+        if (!postHistoryCache?.length) return -1;
+
+        const bKey = postRefKey(bookmark);
+        let histIdx = -1;
+        for (let i = 0; i < postHistoryCache.length; i++) {
+            if (postRefKey(postHistoryCache[i]) === bKey) {
+                histIdx = i;
+                break;
+            }
+        }
+        if (histIdx < 0) {
+            try {
+                const bId = BigInt(bookmark.tweetId);
+                for (let i = 0; i < postHistoryCache.length; i++) {
+                    const h = postHistoryCache[i];
+                    if (!h?.tweetId) continue;
+                    try {
+                        if (BigInt(h.tweetId) === bId && !!h.isRepost === !!bookmark.isRepost) {
+                            histIdx = i;
+                            break;
+                        }
+                    } catch (e) {
+                        continue;
+                    }
+                }
+            } catch (e) {
+                return -1;
+            }
+        }
+        if (histIdx < 0) return -1;
+
+        // History: früher gelesen = niedrigerer Index = neuer im Feed = niedrigerer Map-Index
+        let newerMapIdx = -1;
+        for (let i = histIdx - 1; i >= 0; i--) {
+            const idx = findBookmarkIndexInMap(postHistoryCache[i]);
+            if (idx >= 0) {
+                newerMapIdx = idx;
+                break;
+            }
+        }
+
+        let olderMapIdx = -1;
+        for (let i = histIdx + 1; i < postHistoryCache.length; i++) {
+            const idx = findBookmarkIndexInMap(postHistoryCache[i]);
+            if (idx >= 0) {
+                olderMapIdx = idx;
+                break;
+            }
+        }
+
+        if (newerMapIdx >= 0 && olderMapIdx >= 0) {
+            return newerMapIdx + 1 <= olderMapIdx ? newerMapIdx + 1 : olderMapIdx;
+        }
+        if (newerMapIdx >= 0) return newerMapIdx + 1;
+        if (olderMapIdx >= 0) return olderMapIdx;
+        return -1;
+    }
+
+    function computeBookmarkIdxInOrderedKeys(orderedKeys, bookmark) {
+        if (!bookmark?.tweetId || !orderedKeys?.length) return -1;
+
+        const key = postRefKey(bookmark);
+        const listIdx = key ? orderedKeys.indexOf(key) : -1;
+
+        try {
+            const targetId = BigInt(bookmark.tweetId);
+            const targetRepost = !!bookmark.isRepost;
+            // Landkarte: Index 0 = neueste Posts, höhere Indizes = älter
+            let idIdx = orderedKeys.length;
+
+            for (let i = 0; i < orderedKeys.length; i++) {
+                const entry = timelineMapByKey.get(orderedKeys[i]);
+                if (!entry?.tweetId) continue;
+                const entryRepost = !!entry.isRepost;
+                const entryId = BigInt(entry.tweetId);
+
+                if (entryId === targetId && entryRepost === targetRepost) {
+                    idIdx = i;
+                    break;
+                }
+                // Eintrag älter als Bookmark → Bookmark gehört davor (niedrigerer Index)
+                if (entryId < targetId) {
+                    idIdx = i;
+                    break;
+                }
+            }
+
+            if (listIdx >= 0 && Math.abs(listIdx - idIdx) > 20) {
+                debugLog('Search', `Bookmark-Index korrigiert: ${listIdx} → ${idIdx} (Tweet-ID @${bookmark.authorHandler})`);
+            } else if (idIdx <= 2 && listIdx < 0 && orderedKeys.length > 80) {
+                debugLog('Search', `Bookmark-Index ${idIdx} (@${bookmark.authorHandler}) — prüfe Chronologie in Landkarte`);
+            }
+            return idIdx;
+        } catch (e) {
+            return listIdx;
+        }
+    }
+
+    function ensureBookmarkInMap(bookmark) {
+        if (!bookmark?.tweetId) return -1;
+
+        const key = postRefKey(bookmark);
+        if (!key) return -1;
+
+        const existingIdx = findBookmarkIndexInMap(bookmark);
+        if (existingIdx >= 0) {
+            const entry = timelineMapByKey.get(key);
+            if (entry) {
+                entry.authorHandler = bookmark.authorHandler || entry.authorHandler;
+                entry.timestamp = bookmark.timestamp || entry.timestamp;
+            }
+            const correctIdx = computeBookmarkIdxInOrderedKeys(timelineMapOrderedKeys, bookmark);
+            if (correctIdx >= 0 && Math.abs(existingIdx - correctIdx) > 20) {
+                timelineMapOrderedKeys.splice(existingIdx, 1);
+                const insertAt = Math.min(Math.max(0, correctIdx > existingIdx ? correctIdx - 1 : correctIdx), timelineMapOrderedKeys.length);
+                timelineMapOrderedKeys.splice(insertAt, 0, key);
+                debugLog('Map', `Lesestelle per Tweet-ID verschoben: ${existingIdx} → ${insertAt}`);
+                persistTimelineMap(true);
+                return insertAt;
+            }
+            return existingIdx;
+        }
+
+        const nowIso = new Date().toISOString();
+        timelineMapByKey.set(key, {
+            key,
+            tweetId: bookmark.tweetId,
+            authorHandler: bookmark.authorHandler,
+            isRepost: !!bookmark.isRepost,
+            timestamp: bookmark.timestamp,
+            lastDomY: null,
+            lastSeenAt: nowIso,
+            inDom: false
+        });
+
+        let insertIdx = findInsertIndexFromHistory(bookmark);
+        if (insertIdx < 0) {
+            insertIdx = timelineMapOrderedKeys.length;
+            debugLog('Map', `Lesestelle ohne History-Anker ans Ende gesetzt (idx ${insertIdx})`);
+        } else {
+            debugLog('Map', `Lesestelle via History-Anker eingefügt (idx ${insertIdx}, ghost)`);
+        }
+
+        timelineMapOrderedKeys.splice(insertIdx, 0, key);
+        trimTimelineMap();
+        persistTimelineMap(true);
+        return insertIdx;
+    }
+
+    function getVisibleMapIndexRange() {
+        const visible = getVisiblePosts();
+        if (!visible.length || !timelineMapOrderedKeys.length) {
+            return { min: -1, max: -1 };
+        }
+
+        let min = Infinity;
+        let max = -1;
+        for (const vis of visible) {
+            const idx = findBookmarkIndexInMap(vis);
+            if (idx >= 0) {
+                min = Math.min(min, idx);
+                max = Math.max(max, idx);
+            }
+        }
+
+        if (min === Infinity) return { min: -1, max: -1 };
+        return { min, max };
+    }
+
+    function getLoadedDomMapIndexRange() {
+        let newest = -1;
+        let oldest = -1;
+
+        for (let i = 0; i < timelineMapOrderedKeys.length; i++) {
+            const entry = timelineMapByKey.get(timelineMapOrderedKeys[i]);
+            if (!entry?.inDom) continue;
+            if (newest < 0) newest = i;
+            oldest = i;
+        }
+
+        return { newest, oldest, min: newest, max: oldest };
+    }
+
+    function getDomIndexRangeInSnapshotOrder(orderedKeys) {
+        if (!orderedKeys?.length) return { newest: -1, oldest: -1, min: -1, max: -1 };
+
+        const keyToIdx = new Map(orderedKeys.map((key, idx) => [key, idx]));
+        let newest = -1;
+        let oldest = -1;
+
+        for (const parsed of getAllLoadedPostsParsed()) {
+            const key = postRefKey(parsed);
+            if (!key || !keyToIdx.has(key)) continue;
+            const idx = keyToIdx.get(key);
+            if (newest < 0 || idx < newest) newest = idx;
+            if (oldest < 0 || idx > oldest) oldest = idx;
+        }
+
+        return { newest, oldest, min: newest, max: oldest };
+    }
+
+    function isBookmarkWithinLoadedMapRange(bookmark) {
+        const idx = findBookmarkIndexInMap(bookmark);
+        if (idx < 0) return false;
+        const { newest, oldest } = getLoadedDomMapIndexRange();
+        if (newest < 0) return false;
+        return idx >= newest && idx <= oldest;
+    }
+
+    function captureMapSnapshotForSearch(bookmark = lastReadPost) {
+        scrollState.mapSnapshotOrderedKeys = [...timelineMapOrderedKeys];
+        scrollState.mapSnapshotAtSearchStart = new Set(scrollState.mapSnapshotOrderedKeys);
+        scrollState.mapSnapshotTweetIdToIdx = new Map();
+        for (let i = 0; i < scrollState.mapSnapshotOrderedKeys.length; i++) {
+            const entry = timelineMapByKey.get(scrollState.mapSnapshotOrderedKeys[i]);
+            if (!entry?.tweetId) continue;
+            scrollState.mapSnapshotTweetIdToIdx.set(`${entry.tweetId}-${!!entry.isRepost}`, i);
+        }
+        scrollState.mapSnapshotBookmarkKey = bookmark ? postRefKey(bookmark) : null;
+        scrollState.mapSnapshotBookmarkIdx = bookmark
+            ? computeBookmarkIdxInOrderedKeys(scrollState.mapSnapshotOrderedKeys, bookmark)
+            : -1;
+        scrollState.searchCoarseDirection = null;
+        scrollState.largeScrollCount = 0;
+        scrollState.isSlowScrollMode = false;
+        scrollState.slowScrollLockedDirection = null;
+        scrollState.slowScrollFineAttempts = 0;
+        scrollState.searchTopRetryDone = false;
+        debugLog('Search', `Landkarten-Snapshot: ${scrollState.mapSnapshotAtSearchStart.size} Einträge, Ziel-idx ${scrollState.mapSnapshotBookmarkIdx} (eingefroren, Tweet-ID)`);
+    }
+
+    function clearMapSnapshotForSearch() {
+        scrollState.mapSnapshotAtSearchStart = null;
+        scrollState.mapSnapshotOrderedKeys = null;
+        scrollState.mapSnapshotTweetIdToIdx = null;
+        scrollState.mapSnapshotBookmarkKey = null;
+        scrollState.mapSnapshotBookmarkIdx = -1;
+        scrollState.searchCoarseDirection = null;
+        scrollState.slowScrollLockedDirection = null;
+        scrollState.slowScrollFineAttempts = 0;
+        scrollState.searchTopRetryDone = false;
+    }
+
+    function isSearchFineZoneDistance(mapDistance) {
+        return mapDistance !== null && mapDistance <= CONFIG.SEARCH_FINE_ZONE_HYSTERESIS;
+    }
+
+    function isSearchFineZoneActive(mapDistance) {
+        if (!isSearchFineZoneDistance(mapDistance)) return false;
+        const frozenIdx = getFrozenSearchBookmarkIdx();
+        const nearTopTarget = frozenIdx >= 0 && frozenIdx < CONFIG.SEARCH_TOP_RETRY_MAX_IDX;
+        return scrollState.isSlowScrollMode ||
+            scrollState.slowScrollLockedDirection !== null ||
+            scrollState.slowScrollFineAttempts > 0 ||
+            nearTopTarget;
+    }
+
+    async function landExactSearchHit(searchBookmark, postElement, diagCode, onCleanup) {
+        debugLog('Search', `Exakter Treffer (${diagCode}):`, searchBookmark);
+        lastReadPost.found = true;
+        updateHighlightedPost();
+        setTimeout(() => scrollToPostWithHighlight(postElement), 250);
+        activateRestoreSuppression(searchBookmark.tweetId);
+        markTopVisiblePost(false);
+        diagEndFlow('ok', diagCode, 'Ziel exakt gefunden', { target: diagBookmark(searchBookmark) });
+        clearMapSnapshotForSearch();
+        endManualSearchSession();
+        dismissActionPopup();
+        if (typeof onCleanup === 'function') onCleanup();
+    }
+
+    async function finishSearchWhenFineExhausted(searchBookmark, onCleanup) {
+        const frozenIdx = getFrozenSearchBookmarkIdx();
+        if (frozenIdx >= 0 && frozenIdx < CONFIG.SEARCH_TOP_RETRY_MAX_IDX && !scrollState.searchTopRetryDone) {
+            scrollState.searchTopRetryDone = true;
+            debugLog('Search', `Feinbereich erschöpft — Timeline-Top laden (Ziel-idx ${frozenIdx})`);
+            window.scrollTo({ top: 0, behavior: 'auto' });
+            await new Promise(r => setTimeout(r, 700));
+            const topExact = findBookmarkExactInDom(searchBookmark);
+            if (topExact?.element) {
+                await landExactSearchHit(searchBookmark, topExact.element, 'SEARCH_TOP_RETRY_EXACT', onCleanup);
+                return true;
+            }
+        }
+
+        const resolved = resolveReadingPosition(searchBookmark);
+        if (resolved?.strategy === 'exact' && resolved?.post?.element) {
+            await applyResolvedReadingPosition(resolved, {
+                adopt: false,
+                expectedBookmark: searchBookmark,
+                verifySource: 'search-fine-exhausted',
+            });
+            diagEndFlow('ok', 'SEARCH_FINE_RESOLVE_EXACT', 'Resolve exakt nach Feinbereich', {
+                target: diagBookmark(searchBookmark),
+            });
+            clearMapSnapshotForSearch();
+            endManualSearchSession();
+            dismissActionPopup();
+            if (typeof onCleanup === 'function') onCleanup();
+            return true;
+        }
+
+        debugLog('Search', 'Feinbereich ohne Treffer — kein Emergency-Adopt');
+        showPopup('tweetIdNotFound', 6000, {
+            authorHandler: searchBookmark.authorHandler,
+            tweetId: searchBookmark.tweetId,
+        });
+        diagEndFlow('warn', 'SEARCH_FINE_EXHAUSTED', 'Feinbereich ohne exakten Treffer', {
+            target: diagBookmark(searchBookmark),
+            resolveStrategy: resolved?.strategy ?? null,
+            resolveConfidence: resolved?.confidence ?? null,
+        });
+        clearMapSnapshotForSearch();
+        endManualSearchSession();
+        dismissActionPopup();
+        if (typeof onCleanup === 'function') onCleanup();
+        return false;
+    }
+
+    function getFrozenSearchBookmarkIdx() {
+        return scrollState.mapSnapshotBookmarkIdx >= 0 ? scrollState.mapSnapshotBookmarkIdx : -1;
+    }
+
+    function getSearchViewportIndexRange() {
+        const ordered = scrollState.mapSnapshotOrderedKeys;
+        if (!ordered?.length) {
+            return getVisibleMapIndexRange();
+        }
+
+        const keyToIdx = new Map(ordered.map((key, idx) => [key, idx]));
+        const tweetIdToIdx = scrollState.mapSnapshotTweetIdToIdx;
+        const visible = getVisiblePosts();
+        const indices = [];
+
+        for (const vis of visible) {
+            if (!vis?.tweetId) continue;
+            let idx = -1;
+            const key = postRefKey(vis);
+            if (key && keyToIdx.has(key)) {
+                idx = keyToIdx.get(key);
+            } else if (tweetIdToIdx?.size) {
+                idx = tweetIdToIdx.get(`${vis.tweetId}-${!!vis.isRepost}`) ?? -1;
+            }
+            if (idx >= 0) indices.push(idx);
+        }
+
+        if (!indices.length) return { min: -1, max: -1, hits: 0 };
+
+        if (indices.length >= 3) {
+            indices.sort((a, b) => a - b);
+            const median = indices[Math.floor(indices.length / 2)];
+            const cluster = indices.filter(i => Math.abs(i - median) <= 40);
+            if (cluster.length >= 2) {
+                return {
+                    min: Math.min(...cluster),
+                    max: Math.max(...cluster),
+                    hits: cluster.length
+                };
+            }
+        }
+
+        return {
+            min: Math.min(...indices),
+            max: Math.max(...indices),
+            hits: indices.length
+        };
+    }
+
+    function resolveSearchDirection(bookmark, bookmarkIdx, viewportMin, viewportMax) {
+        let snapshotDirection = null;
+        let distance = 0;
+
+        if (bookmarkIdx >= 0 && viewportMin >= 0) {
+            if (bookmarkIdx < viewportMin) {
+                snapshotDirection = 'up';
+                distance = viewportMin - bookmarkIdx;
+            } else if (bookmarkIdx > viewportMax) {
+                snapshotDirection = 'down';
+                distance = bookmarkIdx - viewportMax;
+            } else {
+                distance = 0;
+                snapshotDirection = bookmarkIdx <= (viewportMin + viewportMax) / 2 ? 'up' : 'down';
+            }
+        }
+
+        const tweetDirection = inferSearchDirectionFromTweetId(bookmark);
+
+        if (snapshotDirection && tweetDirection && snapshotDirection !== tweetDirection) {
+            if (bookmarkIdx < 30 && viewportMin > 80) {
+                debugLog('Search', `Richtung per Tweet-ID (Bookmark idx ${bookmarkIdx} verdächtig): ${tweetDirection}`);
+                return { direction: tweetDirection, distance: Math.max(distance, Math.abs(viewportMin - bookmarkIdx)) };
+            }
+            if (distance > 12) {
+                debugLog('Search', `Richtungs-Korrektur: Snapshot=${snapshotDirection} ≠ Tweet-ID=${tweetDirection} (Abstand ${distance}) → Tweet-ID`);
+                return { direction: tweetDirection, distance: distance || 99 };
+            }
+        }
+        if (snapshotDirection) {
+            return { direction: snapshotDirection, distance };
+        }
+        return { direction: tweetDirection, distance: 99 };
+    }
+
+    function inferSearchDirectionFromTweetId(bookmark) {
+        if (!bookmark?.tweetId) return 'down';
+
+        const visible = getVisiblePosts();
+        if (!visible.length) return 'down';
+
+        let visMin = null;
+        let visMax = null;
+        for (const vis of visible) {
+            if (!vis?.tweetId) continue;
+            try {
+                const id = BigInt(vis.tweetId);
+                if (visMin === null || id < visMin) visMin = id;
+                if (visMax === null || id > visMax) visMax = id;
+            } catch (e) {
+                continue;
+            }
+        }
+
+        try {
+            const targetId = BigInt(bookmark.tweetId);
+            if (visMax !== null && targetId > visMax) return 'up';
+            if (visMin !== null && targetId < visMin) return 'down';
+        } catch (e) {
+            return 'down';
+        }
+
+        return 'down';
+    }
+
+    function getHistoricalMapOverlapInDom() {
+        const snapshot = scrollState.mapSnapshotAtSearchStart;
+        if (!snapshot?.size) return { count: 0, keys: [] };
+
+        const hits = [];
+        const seen = new Set();
+        for (const parsed of getAllLoadedPostsParsed()) {
+            const key = postRefKey(parsed);
+            if (!key || !snapshot.has(key) || seen.has(key)) continue;
+            seen.add(key);
+            hits.push(key);
+        }
+        return { count: hits.length, keys: hits };
+    }
+
+    /**
+     * Nach vielen neuen Posts (z. B. über Nacht) sind zunächst nur unbekannte Beiträge im DOM.
+     * In diesem Zustand dürfen normale Such-Limits nicht zum Notfall-Landing führen —
+     * erst wenn historische Landkarten-Posts sichtbar werden, greifen wieder die üblichen Limits.
+     */
+    function isAwaitingHistoricalMapAnchors(bookmark = lastReadPost) {
+        if (!searchControl.isSearching || !bookmark?.tweetId) return false;
+
+        const snapshot = scrollState.mapSnapshotAtSearchStart;
+        if (!snapshot?.size || snapshot.size < 2) return false;
+
+        const bookmarkIdx = scrollState.mapSnapshotBookmarkIdx >= 0
+            ? scrollState.mapSnapshotBookmarkIdx
+            : findBookmarkIndexInMap(bookmark);
+        if (bookmarkIdx < 0) return false;
+
+        const { oldest } = scrollState.mapSnapshotOrderedKeys?.length
+            ? getDomIndexRangeInSnapshotOrder(scrollState.mapSnapshotOrderedKeys)
+            : getLoadedDomMapIndexRange();
+        if (oldest < 0 || bookmarkIdx <= oldest) return false;
+
+        const overlap = getHistoricalMapOverlapInDom();
+        if (overlap.count > 0) {
+            debugLog('Search', `Historische Landkarten-Posts im DOM (${overlap.count}) — normale Such-Limits aktiv`);
+            return false;
+        }
+
+        debugLog('Search', `Noch keine historischen Landkarten-Posts (Ziel-idx ${bookmarkIdx}, geladen bis idx ${oldest})`);
+        return true;
+    }
+
+    function updateSearchDirectionFromMap(bookmark) {
+        const useSnapshot = searchControl.isSearching && scrollState.mapSnapshotOrderedKeys?.length;
+        let bookmarkIdx = useSnapshot ? getFrozenSearchBookmarkIdx() : findBookmarkIndexInMap(bookmark);
+
+        if (bookmarkIdx < 0) {
+            if (!useSnapshot) {
+                ensureBookmarkInMap(bookmark);
+                bookmarkIdx = findBookmarkIndexInMap(bookmark);
+            }
+        }
+
+        const viewport = useSnapshot ? getSearchViewportIndexRange() : getVisibleMapIndexRange();
+        const { min, max } = viewport;
+        const resolved = resolveSearchDirection(bookmark, bookmarkIdx, min, max);
+        const { direction: newDirection, distance } = resolved;
+
+        if (min < 0) {
+            scrollState.searchDirection = newDirection;
+            scrollState.isSlowScrollMode = false;
+            scrollState.searchCoarseDirection = distance > 12 ? newDirection : null;
+            debugLog('Search', `Kein Viewport-Anker im Snapshot — Richtung: ${newDirection}`);
+            return null;
+        }
+
+        const coarseThreshold = 12;
+        if (distance > coarseThreshold) {
+            scrollState.slowScrollLockedDirection = null;
+            scrollState.slowScrollFineAttempts = 0;
+            scrollState.searchCoarseDirection = newDirection;
+            scrollState.searchDirection = newDirection;
+            scrollState.isSlowScrollMode = false;
+            scrollState.largeScrollCount = 0;
+            const label = useSnapshot ? 'Snapshot-Viewport' : 'Viewport';
+            debugLog('Search', `${label}: Ziel idx ${bookmarkIdx} außerhalb (${min}–${max}, Abstand ${distance}) → grob ${newDirection}`);
+        } else if (distance > 0) {
+            const nearTopTarget = bookmarkIdx >= 0 && bookmarkIdx < CONFIG.SEARCH_TOP_RETRY_MAX_IDX;
+            const inFineHysteresis = distance <= CONFIG.SEARCH_FINE_ZONE_HYSTERESIS &&
+                (nearTopTarget ||
+                    scrollState.slowScrollLockedDirection !== null ||
+                    scrollState.slowScrollFineAttempts > 0);
+            if (inFineHysteresis) {
+                scrollState.isSlowScrollMode = true;
+                if (scrollState.slowScrollLockedDirection === null) {
+                    scrollState.slowScrollLockedDirection = newDirection;
+                }
+                scrollState.searchDirection = scrollState.slowScrollLockedDirection;
+                scrollState.searchCoarseDirection = null;
+                debugLog('Search', `Feinbereich-Hysterese (Ziel idx ${bookmarkIdx}, ${min}–${max}, Abstand ${distance}) → ${scrollState.searchDirection}`);
+            } else {
+                scrollState.slowScrollLockedDirection = null;
+                scrollState.slowScrollFineAttempts = 0;
+                scrollState.searchDirection = newDirection;
+                scrollState.isSlowScrollMode = scrollState.largeScrollCount >= scrollState.maxLargeScrolls;
+                scrollState.searchCoarseDirection = null;
+                debugLog('Search', `Annäherung: Ziel idx ${bookmarkIdx} nahe Viewport (${min}–${max}, Abstand ${distance}) → ${newDirection}`);
+            }
+        } else {
+            scrollState.searchCoarseDirection = null;
+            scrollState.isSlowScrollMode = true;
+            if (scrollState.slowScrollLockedDirection === null) {
+                const distToTop = bookmarkIdx - min;
+                const distToBottom = max - bookmarkIdx;
+                scrollState.slowScrollLockedDirection = distToTop <= distToBottom ? 'up' : 'down';
+            }
+            scrollState.searchDirection = scrollState.slowScrollLockedDirection;
+            debugLog('Search', `Slow-Scroll fein (Ziel idx ${bookmarkIdx} in Viewport-Spanne ${min}–${max}, Richtung ${scrollState.searchDirection})`);
+        }
+
+        return null;
+    }
+
+    function getMapDistanceToTarget(bookmark) {
+        const useSnapshot = searchControl.isSearching && scrollState.mapSnapshotOrderedKeys?.length;
+        const idx = useSnapshot ? getFrozenSearchBookmarkIdx() : findBookmarkIndexInMap(bookmark);
+        if (idx < 0) return null;
+
+        const viewport = useSnapshot ? getSearchViewportIndexRange() : getVisibleMapIndexRange();
+        const { min, max } = viewport;
+        if (min >= 0) {
+            if (idx < min) return min - idx;
+            if (idx > max) return idx - max;
+            return 0;
+        }
+
+        if (!useSnapshot) {
+            const { newest, oldest } = getLoadedDomMapIndexRange();
+            if (newest < 0) return null;
+            if (idx < newest) return newest - idx;
+            if (idx > oldest) return idx - oldest;
+        }
+
+        return null;
+    }
+
+    // ============================================================
+    // Reading Position Resolve Engine
+    // exact → older (Landkarte) → emergency (Landkarte)
+    // classifyFeedState für Popups/Diagnose
+    // ============================================================
+
+    function compactPostRef(parsed) {
+        if (!parsed) return null;
+        return {
+            tweetId: parsed.tweetId,
+            authorHandler: parsed.authorHandler,
+            isRepost: parsed.isRepost,
+            timestamp: parsed.timestamp
+        };
+    }
+
+    function postRefKey(ref) {
+        if (!ref?.tweetId) return null;
+        return `${ref.tweetId}-${!!ref.isRepost}`;
+    }
+
+    function captureReadingContext(anchorElement) {
+        const empty = { neighborsBefore: [], neighborsAfter: [], visibleAtSave: [] };
+        if (!anchorElement) return empty;
+
+        const all = getAllLoadedPostsParsed();
+        if (!all.length) return empty;
+
+        const anchorParsed = parseLoadedPost(anchorElement);
+        if (!anchorParsed) return empty;
+
+        const docSorted = [...all].sort((a, b) => {
+            const aY = a.element.getBoundingClientRect().top + window.scrollY;
+            const bY = b.element.getBoundingClientRect().top + window.scrollY;
+            return aY - bY;
+        });
+
+        const anchorKey = `${anchorParsed.tweetId}-${anchorParsed.isRepost}`;
+        const anchorIdx = docSorted.findIndex(p => `${p.tweetId}-${p.isRepost}` === anchorKey);
+        const n = CONFIG.CONTEXT_NEIGHBOR_COUNT;
+
+        let neighborsBefore = [];
+        let neighborsAfter = [];
+        if (anchorIdx >= 0) {
+            neighborsBefore = docSorted
+                .slice(Math.max(0, anchorIdx - n), anchorIdx)
+                .map(compactPostRef)
+                .filter(Boolean);
+            neighborsAfter = docSorted
+                .slice(anchorIdx + 1, anchorIdx + 1 + n)
+                .map(compactPostRef)
+                .filter(Boolean);
+        }
+
+        const visibleAtSave = getVisiblePosts()
+            .map(v => compactPostRef(parseLoadedPost(v.element)))
+            .filter(Boolean);
+
+        return { neighborsBefore, neighborsAfter, visibleAtSave };
+    }
+
+    function classifyFeedState(bookmark = lastReadPost) {
+        const all = getAllLoadedPostsParsed();
+
+        if (pendingNewPosts >= CONFIG.MASS_INFLUX_PENDING_THRESHOLD) {
+            return 'MASS_INFLUX';
+        }
+
+        if (bookmark?.tweetId && all.length >= 40) {
+            try {
+                const bookmarkId = BigInt(bookmark.tweetId);
+                const ids = all.map(p => p.bigId);
+                const newest = ids.reduce((max, id) => (id > max ? id : max), ids[0]);
+                const loadedSpan = Number(newest - ids.reduce((min, id) => (id < min ? id : min), ids[0]));
+                const gapFromBookmark = Number(newest - bookmarkId);
+                if (loadedSpan > 0 && gapFromBookmark > loadedSpan * 0.6 && all.length >= 80) {
+                    return 'MASS_INFLUX';
+                }
+            } catch (e) {
+                debugLog('Resolve', 'classifyFeedState ID-Vergleich fehlgeschlagen:', e);
+            }
+        }
+
+        if (postHistoryCache.length >= 5) {
+            const recent = postHistoryCache.slice(-20);
+            const domKeys = new Set(all.map(p => `${p.tweetId}-${p.isRepost}`));
+            const found = recent.filter(e => domKeys.has(`${e.tweetId}-${!!e.isRepost}`)).length;
+            if (recent.length > 0 && found / recent.length < 0.35) {
+                return 'DEGRADED';
+            }
+        }
+
+        const ctx = bookmark?.context;
+        if (ctx && bookmark?.tweetId) {
+            const anchorPresent = all.some(p =>
+                p.tweetId === bookmark.tweetId &&
+                p.authorHandler === bookmark.authorHandler &&
+                p.isRepost === !!bookmark.isRepost
+            );
+            if (!anchorPresent) {
+                const refs = [...(ctx.neighborsBefore || []), ...(ctx.neighborsAfter || [])];
+                const domKeys = new Set(all.map(p => `${p.tweetId}-${p.isRepost}`));
+                const surviving = refs.filter(r => domKeys.has(postRefKey(r))).length;
+                if (surviving >= 2) {
+                    return 'REORDER';
+                }
+            }
+        }
+
+        return 'NORMAL';
+    }
+
+    function matchByContext(bookmark, all, feedState = 'NORMAL') {
+        const ctx = bookmark?.context;
+        if (!ctx || all.length === 0) return null;
+
+        const contextRefs = [];
+        const seen = new Set();
+        for (const ref of [
+            ...(ctx.neighborsBefore || []),
+            ...(ctx.neighborsAfter || []),
+            ...(ctx.visibleAtSave || [])
+        ]) {
+            const key = postRefKey(ref);
+            if (!key || seen.has(key)) continue;
+            seen.add(key);
+            contextRefs.push(ref);
+        }
+        if (contextRefs.length === 0) return null;
+
+        const docSorted = [...all].sort((a, b) => {
+            const aY = a.element.getBoundingClientRect().top + window.scrollY;
+            const bY = b.element.getBoundingClientRect().top + window.scrollY;
+            return aY - bY;
+        });
+
+        const refPositions = new Map();
+        docSorted.forEach((p, idx) => {
+            refPositions.set(`${p.tweetId}-${p.isRepost}`, idx);
+        });
+
+        const beforePositions = (ctx.neighborsBefore || [])
+            .map(postRefKey)
+            .filter(k => refPositions.has(k))
+            .map(k => refPositions.get(k));
+        const afterPositions = (ctx.neighborsAfter || [])
+            .map(postRefKey)
+            .filter(k => refPositions.has(k))
+            .map(k => refPositions.get(k));
+
+        const overshootPenalty = feedState === 'MASS_INFLUX' ? 8 : 15;
+        let bookmarkId = null;
+        try {
+            bookmarkId = BigInt(bookmark.tweetId);
+        } catch (e) {
+            bookmarkId = null;
+        }
+
+        let best = null;
+        let bestScore = 0;
+
+        for (let i = 0; i < docSorted.length; i++) {
+            const candidate = docSorted[i];
+            let score = 0;
+
+            for (const ref of contextRefs) {
+                const key = postRefKey(ref);
+                const refIdx = refPositions.get(key);
+                if (refIdx === undefined) continue;
+                const distance = Math.abs(refIdx - i);
+                if (distance <= 2) score += 25;
+                else if (distance <= 5) score += 12;
+                else score += 4;
+            }
+
+            if ((ctx.visibleAtSave || []).some(v => postRefKey(v) === `${candidate.tweetId}-${candidate.isRepost}`)) {
+                score += 15;
+            }
+
+            if (beforePositions.length > 0) {
+                const maxBefore = Math.max(...beforePositions);
+                if (i >= maxBefore && i <= maxBefore + 2) score += 20;
+            }
+            if (afterPositions.length > 0) {
+                const minAfter = Math.min(...afterPositions);
+                if (i <= minAfter && i >= minAfter - 2) score += 20;
+            }
+
+            if (bookmarkId !== null && candidate.bigId > bookmarkId) {
+                score -= overshootPenalty;
+            }
+
+            if (score > bestScore) {
+                bestScore = score;
+                best = candidate;
+            }
+        }
+
+        if (!best || bestScore < CONFIG.CONTEXT_MATCH_MIN_SCORE) return null;
+
+        const maxPossible = contextRefs.length * 25 + 55;
+        const confidence = Math.max(45, Math.min(85, Math.round((bestScore / Math.max(maxPossible, 1)) * 100)));
+
+        return {
+            post: best,
+            confidence,
+            strategy: 'context',
+            reason: `neighbor-overlap (${bestScore} pts, ${feedState})`
+        };
+    }
+
+    function parseLoadedPost(postElement) {
+        if (!postElement) return null;
+        const tweetId = getPostTweetId(postElement);
+        const authorHandler = getPostAuthorHandler(postElement);
+        const timestamp = getPostTimestamp(postElement);
+        const repostFlag = isRepost(postElement);
+        if (!tweetId || !authorHandler || !timestamp) return null;
+        const postTime = new Date(timestamp).getTime();
+        if (isNaN(postTime)) return null;
+        try {
+            return {
+                element: postElement,
+                tweetId,
+                authorHandler,
+                timestamp,
+                isRepost: repostFlag,
+                bigId: BigInt(tweetId),
+                postTime
+            };
+        } catch (e) {
+            return null;
+        }
+    }
+
+    function getAllLoadedPostsParsed() {
+        return Array.from(document.querySelectorAll('article'))
+            .map(parseLoadedPost)
+            .filter(Boolean);
+    }
+
+    function findNextOlderPostInDom(bookmark, all) {
+        ensureBookmarkInMap(bookmark);
+        const fromMap = findNextOlderPostInMap(bookmark, all);
+        if (fromMap) {
+            diagPush('MAP_OLDER_HIT', 'info', fromMap.reason, {
+                bookmark: diagBookmark(bookmark),
+                mapSize: timelineMapOrderedKeys.length,
+            });
+            return fromMap;
+        }
+
+        return null;
+    }
+
+    function emergencyLandReadingPosition(bookmark = lastReadPost) {
+        const all = getAllLoadedPostsParsed();
+        if (!all.length) return null;
+
+        const domByKey = new Map();
+        for (const parsed of all) {
+            const key = postRefKey(parsed);
+            if (key) domByKey.set(key, parsed);
+        }
+
+        if (bookmark?.tweetId && timelineMapOrderedKeys.length) {
+            const bookmarkIdx = ensureBookmarkInMap(bookmark);
+            if (bookmarkIdx >= 0) {
+                for (let offset = 0; offset < timelineMapOrderedKeys.length; offset++) {
+                    const candidates = offset === 0
+                        ? [bookmarkIdx]
+                        : [bookmarkIdx - offset, bookmarkIdx + offset];
+                    for (const i of candidates) {
+                        if (i < 0 || i >= timelineMapOrderedKeys.length) continue;
+                        const parsed = domByKey.get(timelineMapOrderedKeys[i]);
+                        if (!parsed) continue;
+                        return {
+                            post: parsed,
+                            confidence: offset === 0 ? 95 : Math.max(15, 55 - offset * 4),
+                            strategy: offset === 0 ? 'exact' : 'older',
+                            reason: offset === 0 ? 'map-exact-emergency' : `map-nearest (offset ${offset})`
+                        };
+                    }
+                }
+            }
+        }
+
+        const visibleParsed = getVisiblePosts()
+            .map(v => parseLoadedPost(v.element))
+            .filter(Boolean);
+
+        if (visibleParsed.length > 0) {
+            const pick = visibleParsed[Math.floor(visibleParsed.length / 2)];
+            return {
+                post: pick,
+                confidence: 15,
+                strategy: 'emergency',
+                reason: 'viewport-middle'
+            };
+        }
+
+        const sorted = [...all].sort((a, b) => {
+            const aTop = a.element.getBoundingClientRect().top;
+            const bTop = b.element.getBoundingClientRect().top;
+            return Math.abs(aTop - CONFIG.RESTORE_SCROLL_OFFSET) - Math.abs(bTop - CONFIG.RESTORE_SCROLL_OFFSET);
+        });
+        return {
+            post: sorted[0],
+            confidence: 10,
+            strategy: 'emergency',
+            reason: 'nearest-to-restore-offset'
+        };
+    }
+
+    function snapshotLoadedPostKeys() {
+        const keys = new Set();
+        for (const parsed of getAllLoadedPostsParsed()) {
+            const key = postRefKey(parsed);
+            if (key) keys.add(key);
+        }
+        return keys;
+    }
+
+    function collectNewPostsSinceBaseline(bookmark, baselineKeys) {
+        if (!bookmark?.tweetId || !baselineKeys?.size) return [];
+
+        let bookmarkId = null;
+        try {
+            bookmarkId = BigInt(bookmark.tweetId);
+        } catch (e) {
+            return [];
+        }
+
+        const candidates = [];
+        const seen = new Set();
+        for (const parsed of getAllLoadedPostsParsed()) {
+            const key = postRefKey(parsed);
+            if (!key || seen.has(key)) continue;
+            const isNewByKey = !baselineKeys.has(key);
+            let isNewById = false;
+            try {
+                isNewById = (parsed.bigId ?? BigInt(parsed.tweetId)) > bookmarkId;
+            } catch (e) {
+                continue;
+            }
+            // Nur wirklich neue Beiträge (höhere ID + nicht in Baseline).
+            // Ältere Posts, die beim Scrollen nachgeladen werden, sind kein „Neue Beiträge“-Injekt.
+            if (isNewByKey && isNewById) {
+                seen.add(key);
+                candidates.push(parsed);
+            }
+        }
+        return candidates;
+    }
+
+    function pickOldestNewPost(candidates) {
+        if (!candidates?.length) return null;
+        return candidates.reduce((oldest, post) => {
+            try {
+                const id = post.bigId ?? BigInt(post.tweetId);
+                const oldId = oldest.bigId ?? BigInt(oldest.tweetId);
+                return id < oldId ? post : oldest;
+            } catch (e) {
+                return oldest;
+            }
+        });
+    }
+
+    function mergeNewPostCandidates(existing, incoming) {
+        const merged = [...existing];
+        const seen = new Set(existing.map(p => postRefKey(p)).filter(Boolean));
+        for (const post of incoming) {
+            const key = postRefKey(post);
+            if (!key || seen.has(key)) continue;
+            seen.add(key);
+            merged.push(post);
+        }
+        return merged;
+    }
+
+    /**
+     * Nach „Neue Beiträge“: nach unten scrollen bis Lesestelle gefunden
+     * oder keine weiteren Posts mehr geladen werden → sonst ältester neuer Post.
+     */
+    async function restoreReadingPositionAfterNewPosts(bookmark, baselineKeys) {
+        if (!bookmark?.tweetId) return null;
+
+        let bookmarkId = null;
+        try {
+            bookmarkId = BigInt(bookmark.tweetId);
+        } catch (e) {
+            return null;
+        }
+
+        const maxSteps = CONFIG.NEW_POSTS_SCROLL_SEARCH_MAX_ATTEMPTS;
+        debugLog('Restore', `New-Posts: Scroll nach unten (max ${maxSteps}) — Ziel @${bookmark.authorHandler}`);
+        diagPush('NEWPOSTS_SCROLL_SEARCH', 'info', 'New-Posts Scroll-Restore gestartet', {
+            frozen: diagBookmark(bookmark),
+            baselinePosts: baselineKeys?.size ?? 0,
+            maxSteps,
+        });
+
+        await new Promise(r => setTimeout(r, 450));
+
+        let newPostCandidates = collectNewPostsSinceBaseline(bookmark, baselineKeys);
+        let lastArticleCount = document.querySelectorAll('article').length;
+        let lastScrollHeight = document.body.scrollHeight || document.documentElement.scrollHeight;
+        let stagnantLoads = 0;
+        let stagnantScroll = 0;
+
+        searchControl.isAutoScrolling = true;
+        try {
+            for (let step = 0; step <= maxSteps; step++) {
+                const exact = findBookmarkExactInDom(bookmark);
+                if (exact) {
+                    debugLog('Restore', `Lesestelle gefunden (Schritt ${step}): @${bookmark.authorHandler}`);
+                    return {
+                        post: exact,
+                        confidence: 100,
+                        strategy: 'exact',
+                        reason: step === 0 ? 'new-posts-immediate' : `new-posts-scroll (step ${step})`,
+                        adopt: false,
+                        feedState: classifyFeedState(bookmark),
+                    };
+                }
+
+                newPostCandidates = mergeNewPostCandidates(
+                    newPostCandidates,
+                    collectNewPostsSinceBaseline(bookmark, baselineKeys)
+                );
+
+                if (step > 0) {
+                    const articleCount = document.querySelectorAll('article').length;
+                    const scrollHeight = document.body.scrollHeight || document.documentElement.scrollHeight;
+                    const atBottom = window.scrollY + window.innerHeight >= scrollHeight - 80;
+
+                    stagnantLoads = articleCount === lastArticleCount ? stagnantLoads + 1 : 0;
+                    stagnantScroll = scrollHeight === lastScrollHeight ? stagnantScroll + 1 : 0;
+                    lastArticleCount = articleCount;
+                    lastScrollHeight = scrollHeight;
+
+                    if (stagnantLoads >= CONFIG.NEW_POSTS_SCROLL_STAGNANT_LOADS &&
+                        stagnantScroll >= CONFIG.NEW_POSTS_SCROLL_STAGNANT_HEIGHT &&
+                        atBottom) {
+                        debugLog('Restore', `Keine weiteren Posts (${articleCount} articles, scrollHeight ${scrollHeight})`);
+                        break;
+                    }
+                }
+
+                if (step >= maxSteps) break;
+
+                window.scrollBy({ top: CONFIG.NEW_POSTS_SCROLL_STEP_PX, behavior: 'auto' });
+                await new Promise(r => setTimeout(r, CONFIG.NEW_POSTS_SCROLL_SETTLE_MS));
+                updateTimelineMap('new-posts-restore-scroll', 'down');
+            }
+        } finally {
+            searchControl.isAutoScrolling = false;
+            scrollState.programmaticScrollEndedAt = Date.now();
+        }
+
+        const finalExact = findBookmarkExactInDom(bookmark);
+        if (finalExact) {
+            return {
+                post: finalExact,
+                confidence: 100,
+                strategy: 'exact',
+                reason: 'new-posts-scroll-final',
+                adopt: false,
+                feedState: classifyFeedState(bookmark),
+            };
+        }
+
+        newPostCandidates = mergeNewPostCandidates(
+            newPostCandidates,
+            collectNewPostsSinceBaseline(bookmark, baselineKeys)
+        );
+        const oldestNew = pickOldestNewPost(newPostCandidates);
+        if (oldestNew) {
+            debugLog('Restore', `Lesestelle nicht gefunden — ältester neuer Post: @${oldestNew.authorHandler} ${oldestNew.tweetId} (${newPostCandidates.length} Kandidaten)`);
+            diagPush('NEWPOSTS_OLDEST_NEW', 'warn', 'Lesestelle ersetzt durch ältesten neuen Post', {
+                frozen: diagBookmark(bookmark),
+                adopted: diagBookmark(oldestNew),
+                candidateCount: newPostCandidates.length,
+            });
+            return {
+                post: oldestNew,
+                confidence: 78,
+                strategy: 'new-posts-oldest',
+                reason: 'oldest-injected-post-after-scroll',
+                adopt: true,
+                feedState: classifyFeedState(bookmark),
+            };
+        }
+
+        debugLog('Restore', 'Weder Lesestelle noch neue Posts erkannt');
+        return null;
+    }
+
+    function resolveReadingPosition(bookmark = lastReadPost) {
+        const all = getAllLoadedPostsParsed();
+        const feedState = classifyFeedState(bookmark);
+        debugLog('Resolve', `Feed-State: ${feedState}`);
+
+        if (!bookmark || !bookmark.tweetId) {
+            return emergencyLandReadingPosition(bookmark);
+        }
+
+        ensureBookmarkInMap(bookmark);
+
+        const bookmarkIsRepost = !!bookmark.isRepost;
+
+        const exact = all.find(p =>
+            p.tweetId === bookmark.tweetId &&
+            p.authorHandler === bookmark.authorHandler &&
+            p.isRepost === bookmarkIsRepost
+        );
+        if (exact) {
+            return { post: exact, confidence: 100, strategy: 'exact', reason: 'tweet-id-match', feedState };
+        }
+
+        const older = findNextOlderPostInDom(bookmark, all);
+        if (older) {
+            older.feedState = feedState;
+            debugLog('Resolve', `Exakter Post fehlt — nächst älterer (Landkarte): @${older.post.authorHandler} ${older.post.tweetId}`);
+            return older;
+        }
+
+        debugLog('Resolve', 'Kein älterer Post in Landkarte — Emergency-Landing');
+        const emergency = emergencyLandReadingPosition(bookmark);
+        if (emergency) emergency.feedState = feedState;
+        return emergency;
+    }
+
+    function getResolveStrategyLabel(strategy, lang) {
+        const labels = {
+            de: { exact: 'exakt', older: 'nächster älterer', context: 'Kontext', trail: 'Verlauf', temporal: 'Zeit', emergency: 'Notfall', 'new-posts-oldest': 'ältester neuer Post' },
+            en: { exact: 'exact', older: 'next older', context: 'context', trail: 'history', temporal: 'time', emergency: 'emergency', 'new-posts-oldest': 'oldest new post' }
+        };
+        const table = labels[lang] || labels.en;
+        return table[strategy] || strategy;
+    }
+
+    function getResolvePopupKey(resolved) {
+        if (!resolved || resolved.strategy === 'exact') return null;
+        if (resolved.feedState === 'DEGRADED' || resolved.feedState === 'MASS_INFLUX') {
+            return 'feedStronglyChanged';
+        }
+        if (resolved.confidence >= 40) return 'approximatePosition';
+        return 'tweetIdNotFound';
+    }
+
+    function findBookmarkExactInDom(bookmark) {
+        if (!bookmark?.tweetId) return null;
+        const bookmarkIsRepost = !!bookmark.isRepost;
+        return getAllLoadedPostsParsed().find(p =>
+            p.tweetId === bookmark.tweetId &&
+            p.authorHandler === bookmark.authorHandler &&
+            p.isRepost === bookmarkIsRepost
+        ) || null;
+    }
+
+    function shouldScrollSearchForBookmark(bookmark) {
+        if (!bookmark?.tweetId) return false;
+        // Manuelle Suche: nur ohne Scroll-Suche beenden, wenn exakter Treffer im DOM liegt.
+        // Context/Trail/Temporal können „nah dran“ liegen, während der Ziel-Post wenige Einträge entfernt ist.
+        return findBookmarkExactInDom(bookmark) === null;
+    }
+
+    async function applyResolvedReadingPosition(resolved, options = {}) {
+        const { adopt = true, scroll = true, expectedBookmark = null, verifySource = 'resolve' } = options;
+        if (!resolved?.post?.element) {
+            diagPush('LANDING_FAIL', 'error', 'applyResolvedReadingPosition: kein Post-Element', {
+                strategy: resolved?.strategy,
+                snapshot: diagSnapshot(),
+            });
+            return false;
+        }
+
+        const { post, confidence, strategy } = resolved;
+
+        const fresh = resolveFreshPostElement(post.element, post.tweetId, post.authorHandler) || post.element;
+
+        let skipScroll = scroll && isPostAtReadingOffset(fresh);
+        if (skipScroll && verifySource === 'new-posts-restore' && expectedBookmark) {
+            // Nach New-Posts: nur ohne Scroll beenden, wenn der eingefrorene Bookmark wirklich am 175px-Ziel liegt
+            skipScroll = topPostMatchesBookmark(fresh, expectedBookmark) && isPostAtReadingOffset(fresh);
+            if (!skipScroll) {
+                debugLog('Position', 'New-Posts-Restore: Scroll erzwungen (Bookmark nicht am Ziel-Offset)');
+            }
+        }
+
+        if (skipScroll) {
+            debugLog('Position', 'Restore-Scroll übersprungen — bereits am Ziel-Offset');
+            diagPush('POSITION_SKIP', 'info', 'Restore ohne Scroll (bereits am Offset)', {
+                deviation: Math.round(getPostOffsetDeviation(fresh)),
+            });
+            applyHighlightToPost(fresh, { confidence, strategy });
+        } else if (scroll) {
+            await new Promise(resolve => scrollToPostWithHighlight(post.element, resolve));
+            applyHighlightToPost(fresh, { confidence, strategy });
+        } else {
+            applyHighlightToPost(fresh, { confidence, strategy });
+        }
+
+        if (adopt) {
+            await adoptFallbackPost(fresh);
+            if (lastReadPost) {
+                lastReadPost.resolveStrategy = strategy;
+                lastReadPost.resolveConfidence = confidence;
+            }
+        }
+
+        log('Resolve', `Landing (${strategy}, ${confidence}%): @${post.authorHandler} ${post.tweetId}`);
+        if (expectedBookmark) {
+            diagVerifyLanding(expectedBookmark, resolved, verifySource);
+        }
+        return true;
+    }
+
+    async function landReadingPositionFromResolve(reason = '', bookmark = lastReadPost) {
+        if (reason) {
+            debugLog('Resolve', `Start: ${reason}`);
+        }
+
+        let resolved = resolveReadingPosition(bookmark);
+        if (!resolved) {
+            await new Promise(r => setTimeout(r, 900));
+            resolved = resolveReadingPosition(bookmark);
+        }
+
+        searchControl.isFallbackSearching = true;
+
+        if (resolved) {
+            await applyResolvedReadingPosition(resolved, {
+                expectedBookmark: bookmark,
+                verifySource: reason || 'land-resolve',
+            });
+            dismissActionPopup();
+
+            const popupKey = getResolvePopupKey(resolved);
+            if (popupKey) {
+                const lang = getUserLanguage();
+                showPopup(popupKey, 6000, {
+                    strategy: getResolveStrategyLabel(resolved.strategy, lang)
+                });
+            }
+        } else {
+            log('Resolve', 'Kein article im DOM — Landing nicht möglich');
+            diagPush('RESOLVE_EMPTY_DOM', 'error', `Kein Landing möglich (${reason})`, {
+                expected: diagBookmark(bookmark),
+                snapshot: diagSnapshot(),
+            });
+            dismissActionPopup();
+            showPopup('searchNoPosition', 5000);
+        }
+
+        endManualSearchSession();
+        searchControl.isFallbackSearching = false;
+        return !!resolved;
+    }
+
     /**
      * Zentralisierte Scroll-Logik inklusive Stagnationserkennung.
      * Wird an mehreren Stellen innerhalb der Suche verwendet.
@@ -2065,20 +4250,34 @@
 
         if (currentScrollHeight === scrollState.lastScrollHeight) {
             scrollState.stagnantScrollCount++;
-            if (scrollState.stagnantScrollCount > CONFIG.MAX_STAGNANT_SCROLLS) {
-                log('Search', 'Suche abgebrochen: Keine neuen Posts nach Stagnation (MAX_STAGNANT_SCROLLS).');
-                searchControl.isSearching = false;
+            const awaitingAnchors = isAwaitingHistoricalMapAnchors();
+            const stagnantLimit = awaitingAnchors
+                ? CONFIG.MAP_ANCHOR_SEARCH_MAX_STAGNANT
+                : CONFIG.MAX_STAGNANT_SCROLLS;
+
+            if (scrollState.stagnantScrollCount > stagnantLimit) {
+                log('Search', `Suche abgebrochen: Keine neuen Posts nach Stagnation (${stagnantLimit}).`);
+                diagPush('SEARCH_STAGNATION', 'warn', 'Scroll-Suche stagniert — Fallback-Resolve', {
+                    stagnantScrolls: scrollState.stagnantScrollCount,
+                    awaitingMapAnchors: awaitingAnchors,
+                    snapshot: diagSnapshot(),
+                });
+                clearMapSnapshotForSearch();
+                endManualSearchSession();
                 updateActionPopup('tweetIdNotFound', {
                     authorHandler: lastReadPost?.authorHandler,
                     tweetId: lastReadPost?.tweetId
                 });
-                findAndSetClosestPost();
+                void landReadingPositionFromResolve('stagnation');
 
-                // Sicherer Cleanup über Callback (vermeidet ReferenceError auf lokale Variablen)
                 if (typeof onStagnationCleanup === 'function') {
                     try { onStagnationCleanup(); } catch (e) { /* ignore */ }
                 }
                 return;
+            }
+
+            if (awaitingAnchors && scrollState.stagnantScrollCount > CONFIG.MAX_STAGNANT_SCROLLS) {
+                debugLog('Search', `Stagnation (${scrollState.stagnantScrollCount}), warte weiter auf historische Landkarten-Posts…`);
             }
         } else {
             scrollState.stagnantScrollCount = 0;
@@ -2104,7 +4303,7 @@
     function shouldAbortSearch(reason = '', currentScrollCount = 0, onCleanup = null) {
         const logPrefix = reason ? `[${reason}] ` : '';
         const doCleanup = (dismissPopup = true) => {
-            searchControl.isSearching = false;
+            endManualSearchSession();
             if (dismissPopup) dismissActionPopup();
             if (typeof onCleanup === 'function') {
                 try { onCleanup(); } catch (e) { /* ignore cleanup errors */ }
@@ -2112,12 +4311,13 @@
         };
 
         const startFallbackSearch = () => {
-            searchControl.isSearching = false;
+            clearMapSnapshotForSearch();
+            endManualSearchSession();
             updateActionPopup('tweetIdNotFound', {
                 authorHandler: lastReadPost?.authorHandler,
                 tweetId: lastReadPost?.tweetId
             });
-            findAndSetClosestPost();
+            void landReadingPositionFromResolve('search-abort');
             if (typeof onCleanup === 'function') {
                 try { onCleanup(); } catch (e) { /* ignore cleanup errors */ }
             }
@@ -2125,26 +4325,55 @@
 
         if (searchControl.isSearchCancelled) {
             debugLog('Search', `${logPrefix}Suche abgebrochen durch Benutzer.`);
+            diagPush('SEARCH_CANCELLED', 'warn', 'Suche vom User abgebrochen', { reason, snapshot: diagSnapshot() });
             doCleanup(true);
             return true;
         }
 
         if (!searchControl.isSearching) {
             debugLog('Search', `${logPrefix}Suche bereits beendet.`);
+            diagPush('SEARCH_ALREADY_ENDED', 'anomaly', `Suche-Schleife lief obwohl isSearching=false (${reason})`, {
+                manualSearchActive: searchControl.manualSearchActive,
+                snapshot: diagSnapshot(),
+            });
             doCleanup(true);
             return true;
         }
 
-        if (currentScrollCount > CONFIG.MAX_SCROLL_ATTEMPTS) {
-            log('Search', `${logPrefix}Maximale Scroll-Versuche erreicht, starte Fallback.`);
+        const awaitingAnchors = isAwaitingHistoricalMapAnchors();
+        const scrollAttemptLimit = awaitingAnchors
+            ? CONFIG.MAP_ANCHOR_SEARCH_MAX_ATTEMPTS
+            : CONFIG.MAX_SCROLL_ATTEMPTS;
+        const loadedPostLimit = awaitingAnchors
+            ? CONFIG.MAP_ANCHOR_SEARCH_MAX_LOADED
+            : CONFIG.MAX_LOADED_POSTS_BEFORE_FALLBACK;
+
+        if (currentScrollCount > scrollAttemptLimit) {
+            log('Search', `${logPrefix}Maximale Scroll-Versuche erreicht (${scrollAttemptLimit}), starte Fallback.`);
+            diagPush('SEARCH_MAX_ATTEMPTS', 'warn', 'Max Scroll-Versuche erreicht', {
+                scrollCount: currentScrollCount,
+                awaitingMapAnchors: awaitingAnchors,
+                snapshot: diagSnapshot(),
+            });
             startFallbackSearch();
             return true;
         }
 
-        if (scrollState.totalLoadedPosts > CONFIG.MAX_LOADED_POSTS_BEFORE_FALLBACK) {
-            debugLog('Search', `${logPrefix}Über ${CONFIG.MAX_LOADED_POSTS_BEFORE_FALLBACK} Posts geladen – Suche abgebrochen.`);
+        if (scrollState.totalLoadedPosts > loadedPostLimit) {
+            debugLog('Search', `${logPrefix}Über ${loadedPostLimit} Posts geladen – Suche abgebrochen.`);
+            diagPush('SEARCH_TOO_MANY_POSTS', 'warn', 'Zu viele Posts geladen — Fallback', {
+                loaded: scrollState.totalLoadedPosts,
+                awaitingMapAnchors: awaitingAnchors,
+                snapshot: diagSnapshot(),
+            });
             startFallbackSearch();
             return true;
+        }
+
+        if (awaitingAnchors &&
+            (currentScrollCount > CONFIG.MAX_SCROLL_ATTEMPTS ||
+                scrollState.totalLoadedPosts > CONFIG.MAX_LOADED_POSTS_BEFORE_FALLBACK)) {
+            debugLog('Search', `${logPrefix}Normale Limits überschritten — Suche fortsetzen bis historische Landkarten-Posts erscheinen (${scrollState.totalLoadedPosts} geladen, Versuch ${currentScrollCount}).`);
         }
 
         return false;
@@ -2153,8 +4382,8 @@
 
     async function startRefinedSearchForLastReadPost(fromFile = false) {
     debugLog('Search', 'Starte optimierte Suche für letzte Leseposition...');
-    searchControl.isSearching = true;
-    searchControl.isSearchCancelled = false;
+    beginManualSearchSession();
+    diagBeginFlow('manual-search', { fromFile });
 
     // Wichtig: Such-/Scroll-State zurücksetzen (Punkt 4)
     scrollState.scrollCyclePhase = 0;
@@ -2164,11 +4393,13 @@
     scrollState.isSlowScrollMode = false;
     scrollState.searchDirection = 'down';
     scrollState.lastScrollHeight = 0;
+    clearMapSnapshotForSearch();
 
-    try {   // Safety wrapper: garantiert isSearching=false auch bei Fehlern nach New-Posts-Laden
+    try {
     if (!isScriptActivated) {
         showPopup('searchScrollPrompt', 5000);
-        searchControl.isSearching = false;
+        diagEndFlow('warn', 'SEARCH_NOT_ACTIVATED', 'Skript nicht aktiviert');
+        endManualSearchSession();
         return;
     }
     let storedData = null;
@@ -2178,7 +4409,8 @@
             if (!data) {
                 debugLog('Search', `Keine Leseposition für Account ${account} gefunden.`);
                 showPopup('searchNoPosition', 5000);
-                searchControl.isSearching = false;
+                diagEndFlow('fail', 'SEARCH_NO_BOOKMARK', 'Keine Leseposition gespeichert');
+                endManualSearchSession();
                 return;
             }
             storedData = data;
@@ -2190,10 +4422,19 @@
     if (!storedData || !storedData.tweetId || !storedData.authorHandler || !storedData.timestamp) {
         log('Search', 'Ungültige Leseposition:', storedData);
         showPopup('invalidPosition', 5000);
-        searchControl.isSearching = false;
+        diagEndFlow('fail', 'SEARCH_INVALID_BOOKMARK', 'Ungültige Leseposition', { storedData });
+        endManualSearchSession();
         return;
     }
     lastReadPost = storedData;
+    const searchBookmark = {
+        tweetId: storedData.tweetId,
+        authorHandler: storedData.authorHandler,
+        timestamp: storedData.timestamp,
+        isRepost: !!storedData.isRepost,
+        readAt: storedData.readAt || storedData.timestamp,
+        account: storedData.account
+    };
     if (!lastReadPost.readAt) {
         lastReadPost.readAt = lastReadPost.timestamp;
     }
@@ -2204,60 +4445,77 @@
         const continueSearch = confirm(getTranslatedMessage('oldPositionWarning', getUserLanguage()));
         if (!continueSearch) {
             debugLog('Search', 'Suche abgebrochen: Benutzer hat alte Position abgelehnt.');
-            findAndSetClosestPost();
-            searchControl.isSearching = false;
+            diagEndFlow('warn', 'SEARCH_OLD_DECLINED', 'User lehnte alte Position ab');
+            await landReadingPositionFromResolve('old-position-declined', searchBookmark);
             return;
         }
     }
+    diagPush('BOOKMARK_TARGET', 'info', 'Such-Ziel gesetzt', { target: diagBookmark(searchBookmark) });
     debugLog('Search', `Suche für Account ${account}:`, lastReadPost);
-    const posts = Array.from(document.querySelectorAll('article'));
-    for (const post of posts) {
-        const postTweetId = getPostTweetId(post);
-        const postAuthor = getPostAuthorHandler(post);
-        if (postTweetId === lastReadPost.tweetId && postAuthor === lastReadPost.authorHandler) {
-            debugLog('Search', 'Beitrag bereits im DOM gefunden, scrolle direkt.');
-            lastReadPost.found = true;
-
-            // Border sofort setzen (auch wenn das Scrollen noch nicht perfekt ist)
-            updateHighlightedPost();
-
-            // Wichtiger Fix: Nicht sofort scrollToPostWithHighlight aufrufen,
-            // weil direkt nach Reload / Suchstart das Layout noch nicht stabil ist.
-            // Besser: kurze Wartezeit, damit mehr Posts geladen sind und getBoundingClientRect() korrekte Werte liefert.
+    persistTimelineMap(true);
+    updateTimelineMap('search-init', 'neutral');
+    ensureBookmarkInMap(searchBookmark);
+    captureMapSnapshotForSearch(searchBookmark);
+    const exactInDom = findBookmarkExactInDom(searchBookmark);
+    if (exactInDom) {
+        debugLog('Search', 'Beitrag bereits im DOM gefunden, scrolle direkt.');
+        lastReadPost.found = true;
+        updateHighlightedPost();
+        const finishExactDomSearch = () => {
+            markTopVisiblePost(false);
+            diagEndFlow('ok', 'SEARCH_EXACT_DOM', 'Exakter Treffer im DOM', { target: diagBookmark(searchBookmark) });
+            clearMapSnapshotForSearch();
+            endManualSearchSession();
+        };
+        activateRestoreSuppression(searchBookmark.tweetId);
+        if (isPostAtReadingOffset(exactInDom.element)) {
+            debugLog('Position', 'Exakter Treffer bereits am Lesestellen-Offset — Scroll übersprungen');
+            diagPush('POSITION_SKIP', 'info', 'Lupe: kein Scroll nötig (bereits am Offset)', {
+                deviation: Math.round(getPostOffsetDeviation(exactInDom.element)),
+            });
+            scheduleHighlightRetries(searchBookmark.tweetId, searchBookmark.authorHandler, [0, 300, 900, 2000, 3500]);
+            finishExactDomSearch();
+        } else {
             setTimeout(() => {
-                scrollToPostWithHighlight(post);
+                scrollToPostWithHighlight(exactInDom.element, finishExactDomSearch);
             }, 450);
-
-            markTopVisiblePost(true, true); // Explizite Suche → ältere Position erlaubt
-
-            // Nur beim ersten Finden in dieser Suche aktivieren (verhindert Re-Armen bei wiederholten internen Finds)
-            if (!lastReadPost.found) {
-                activateRestoreSuppression(postTweetId);
-            }
-
-            searchControl.isSearching = false;
-            return;
         }
+        return;
     }
-    log('Search', 'Post nicht im aktuellen DOM gefunden, starte Scroll-Suche.');
-    popup = createSearchPopup(lastReadPost);
+
+    if (!shouldScrollSearchForBookmark(searchBookmark)) {
+        log('Search', 'Resolve-Landing ohne Scroll-Suche.');
+        diagEndFlow('warn', 'SEARCH_PRE_RESOLVE', 'Kein exakter DOM-Treffer — Resolve ohne Scroll');
+        await landReadingPositionFromResolve('search-pre-resolve', searchBookmark);
+        return;
+    }
+
+    updateSearchDirectionFromMap(searchBookmark);
+    const frozenIdx = getFrozenSearchBookmarkIdx();
+    const viewport = getSearchViewportIndexRange();
+    const inViewportRange = frozenIdx >= 0 && viewport.min >= 0 &&
+        frozenIdx >= viewport.min && frozenIdx <= viewport.max;
+    log('Search', inViewportRange
+        ? `Ziel idx ${frozenIdx} im Viewport (${viewport.min}–${viewport.max}) — Feinsuche.`
+        : `Ziel idx ${frozenIdx} außerhalb Viewport (${viewport.min}–${viewport.max}) — ${scrollState.searchDirection === 'up' ? 'nach oben' : 'nach unten'}.`);
+    popup = createSearchPopup(searchBookmark);
     if (!popup) {
         log('Search', 'Popup konnte nicht erstellt werden.');
-        searchControl.isSearching = false;
+        diagEndFlow('fail', 'SEARCH_NO_POPUP', 'Such-Popup konnte nicht erstellt werden');
+        endManualSearchSession();
         return;
     }
     const checkedTweetIds = new Set();
-    const targetTime = new Date(lastReadPost.timestamp).getTime();
-    const targetId = BigInt(lastReadPost.tweetId);
-    const timeDiffThreshold = 4 * 60 * 60 * 1000;
     const io = new IntersectionObserver(entries => {
         entries.forEach(entry => {
             if (entry.isIntersecting) {
                 const post = entry.target;
-                const postTweetId = getPostTweetId(post);
-                const postAuthor = getPostAuthorHandler(post);
-                if (postTweetId === lastReadPost.tweetId && postAuthor === lastReadPost.authorHandler) {
-                    debugLog('Search', 'Beitrag via IntersectionObserver gefunden:', lastReadPost);
+                const parsed = parseLoadedPost(post);
+                if (parsed &&
+                    parsed.tweetId === searchBookmark.tweetId &&
+                    parsed.authorHandler === searchBookmark.authorHandler &&
+                    parsed.isRepost === searchBookmark.isRepost) {
+                    debugLog('Search', 'Beitrag via IntersectionObserver gefunden:', searchBookmark);
                     lastReadPost.found = true;
                     updateHighlightedPost(); // Border sofort
 
@@ -2266,12 +4524,14 @@
                         scrollToPostWithHighlight(post);
                     }, 300);
 
-                    markTopVisiblePost(true, true); // Explizite Suche → ältere Position erlaubt
-                    if (!lastReadPost.found) {
-                        activateRestoreSuppression(lastReadPost.tweetId);
-                    }
+                    activateRestoreSuppression(searchBookmark.tweetId);
+                    markTopVisiblePost(false);
 
-                    searchControl.isSearching = false;
+                    diagEndFlow('ok', 'SEARCH_IO_FOUND', 'Ziel via IntersectionObserver', {
+                        target: diagBookmark(searchBookmark),
+                    });
+                    clearMapSnapshotForSearch();
+                    endManualSearchSession();
                     dismissActionPopup();
                     window.removeEventListener('keydown', handleSpaceKey);
                     io.disconnect();
@@ -2284,30 +4544,29 @@
             searchControl.isSearchCancelled = true;
             dismissActionPopup();
             showPopup('fallbackSearchCancelled', 5000);
-            debugLog('Search', 'Suche gestoppt durch Benutzer.');
-            searchControl.isSearching = false;
+            debugLog('Search', 'Lupe-Suche per Space abgebrochen — Skript bleibt aktiv (Auto-Save/New-Posts normal).');
+            endManualSearchSession();
             searchControl.isFallbackSearching = false;
+            clearMapSnapshotForSearch();
+            if (isNearTimelineTop() && !isReadingPositionAtTargetOffset()) {
+                newPostsState.autoLoadPaused = false;
+            }
             window.removeEventListener('keydown', handleSpaceKey);
             io.disconnect();
         }
     }
     window.addEventListener('keydown', handleSpaceKey);
-    function getTimestampFromTweetId(tweetId) {
-        const TWITTER_EPOCH = 1288834974657;
-        const timestamp = (Number(tweetId >> 22n) + TWITTER_EPOCH);
-        return timestamp;
-    }
     let scrollCount = 0;
     const search = async () => {
         scrollCount++;
 
-        // Race-Condition-Schutz: Wenn isSearching zwischen Aufrufen von performScrollAndContinue
-        // oder durch andere Handler auf false gesetzt wurde, holen wir uns die Kontrolle zurück.
-        // Das verhindert den sofortigen Abbruch "Suche bereits beendet" am Anfang einer frisch gestarteten Suche
-        // (besonders bei manuellem Laden älterer Positionen oder nach "Neue Beiträge").
-        if (!searchControl.isSearching) {
-            searchControl.isSearching = true;
-            debugLog('Search', '[initial] isSearching war false – Race-Heal aktiviert.');
+        if (!searchControl.manualSearchActive) {
+            debugLog('Search', 'Manuelle Suche beendet — Scroll-Schleife stoppt.');
+            diagPush('SEARCH_LOOP_STOP', 'info', 'Scroll-Schleife sauber beendet');
+            clearMapSnapshotForSearch();
+            window.removeEventListener('keydown', handleSpaceKey);
+            if (io) io.disconnect();
+            return;
         }
 
         if (shouldAbortSearch('initial', scrollCount, () => {
@@ -2335,12 +4594,15 @@
         posts.forEach(post => io.observe(post));
         let found = false;
         for (const post of posts) {
-            const postTweetId = getPostTweetId(post);
-            const postAuthor = getPostAuthorHandler(post);
-            if (checkedTweetIds.has(postTweetId)) continue;
-            checkedTweetIds.add(postTweetId);
-            if (postTweetId === lastReadPost.tweetId && postAuthor === lastReadPost.authorHandler) {
-                debugLog('Search', 'Beitrag gefunden:', lastReadPost);
+            const parsed = parseLoadedPost(post);
+            if (!parsed?.tweetId) continue;
+            const checkKey = `${parsed.tweetId}-${parsed.isRepost}`;
+            if (checkedTweetIds.has(checkKey)) continue;
+            checkedTweetIds.add(checkKey);
+            if (parsed.tweetId === searchBookmark.tweetId &&
+                parsed.authorHandler === searchBookmark.authorHandler &&
+                parsed.isRepost === searchBookmark.isRepost) {
+                debugLog('Search', 'Beitrag gefunden:', searchBookmark);
                 lastReadPost.found = true;
                 updateHighlightedPost();
 
@@ -2348,12 +4610,14 @@
                     scrollToPostWithHighlight(post);
                 }, 250);
 
-                markTopVisiblePost(true, true); // Explizite Suche → ältere Position erlaubt
-                if (!lastReadPost.found) {
-                    activateRestoreSuppression(lastReadPost.tweetId);
-                }
+                activateRestoreSuppression(searchBookmark.tweetId);
+                markTopVisiblePost(false);
 
-                searchControl.isSearching = false;
+                diagEndFlow('ok', 'SEARCH_LOOP_FOUND', 'Ziel in Scroll-Schleife gefunden', {
+                    target: diagBookmark(searchBookmark),
+                });
+                clearMapSnapshotForSearch();
+                endManualSearchSession();
                 dismissActionPopup();
                 window.removeEventListener('keydown', handleSpaceKey);
                 io.disconnect();
@@ -2362,53 +4626,29 @@
             }
         }
         if (found) return;
-        const allLoadedPosts = Array.from(document.querySelectorAll('article'));
-        const allLoadedIds = allLoadedPosts
-            .map(post => {
-                const tweetId = getPostTweetId(post);
-                return tweetId && !isNaN(tweetId) ? BigInt(tweetId) : null;
-            })
-            .filter(id => id !== null);
-        let oldestLoadedId = BigInt(0);
-        let newestLoadedId = BigInt(0);
-        if (allLoadedIds.length > 0) {
-            oldestLoadedId = allLoadedIds.reduce((min, id) => (id < min ? id : min), allLoadedIds[0]);
-            newestLoadedId = allLoadedIds.reduce((max, id) => (id > max ? id : max), allLoadedIds[0]);
-            debugLog('Search', `Älteste ID: ${oldestLoadedId}, Neueste: ${newestLoadedId}, Ziel: ${targetId}`);
-        }
-        if (allLoadedIds.length > 0) {
-            if (targetId > newestLoadedId && scrollState.scrollCyclePhase === 0) {
-                scrollState.searchDirection = 'up';
-                scrollState.scrollCyclePhase = 1;
-                debugLog('Search', 'Lesestelle neuer als geladene Posts → Phase 1 (nach oben)');
-            } else if (targetId < oldestLoadedId && scrollState.scrollCyclePhase === 1) {
-                scrollState.searchDirection = 'down';
-                scrollState.scrollCyclePhase = 2;
-                scrollState.hasCompletedCycle = true;
-                debugLog('Search', 'Lesestelle älter als geladene Posts → Phase 2 (nach unten)');
-            } else if (scrollState.hasCompletedCycle && scrollState.scrollCyclePhase === 2) {
-                debugLog('Search', 'Zyklus abgeschlossen, keine passende Position gefunden.');
-                searchControl.isSearching = false;
-                updateActionPopup('tweetIdNotFound', {
-                    authorHandler: lastReadPost?.authorHandler,
-                    tweetId: lastReadPost?.tweetId
-                });
-                findAndSetClosestPost();
-                window.removeEventListener('keydown', handleSpaceKey);
-                io.disconnect();
+
+        const mapDistance = getMapDistanceToTarget(searchBookmark);
+        const searchCleanup = () => {
+            window.removeEventListener('keydown', handleSpaceKey);
+            io.disconnect();
+        };
+
+        if (isSearchFineZoneDistance(mapDistance)) {
+            const domExact = findBookmarkExactInDom(searchBookmark);
+            if (domExact?.element) {
+                await landExactSearchHit(searchBookmark, domExact.element, 'SEARCH_FINE_DOM', searchCleanup);
+                return;
+            }
+
+            scrollState.slowScrollFineAttempts++;
+            if (scrollState.slowScrollFineAttempts > CONFIG.SLOW_SEARCH_FINE_MAX_ATTEMPTS) {
+                await finishSearchWhenFineExhausted(searchBookmark, searchCleanup);
                 return;
             }
         }
-        if (allLoadedIds.length > 0) {
-            if (targetId >= oldestLoadedId && targetId <= newestLoadedId) {
-                scrollState.isSlowScrollMode = true;
-                debugLog('Search', 'Slow-Scroll-Mode aktiviert (Ziel innerhalb geladener Posts – verhindert Overshoot)');
-            } else if (scrollState.largeScrollCount < scrollState.maxLargeScrolls) {
-                scrollState.isSlowScrollMode = false;
-            }
-        } else if (scrollState.largeScrollCount < scrollState.maxLargeScrolls) {
-            scrollState.isSlowScrollMode = false;
-        }
+
+        updateSearchDirectionFromMap(searchBookmark);
+
         await performScrollAndContinue(search, () => {
             window.removeEventListener('keydown', handleSpaceKey);
             if (io) io.disconnect();
@@ -2419,9 +4659,8 @@
 
     } catch (err) {
         log('Search', 'Unerwarteter Fehler in startRefinedSearchForLastReadPost:', err);
-    } finally {
-        // Immer zurücksetzen, damit markTopVisiblePost und andere Teile wieder arbeiten können
-        searchControl.isSearching = false;
+        diagEndFlow('fail', 'SEARCH_EXCEPTION', String(err?.message || err), { snapshot: diagSnapshot() });
+        endManualSearchSession();
     }
 }
 
@@ -2434,31 +4673,25 @@
         step = baseStep * 3;
     }
 
-    // Einfacher, synchroner Distanz-Faktor basierend auf bereits geladenen Posts (nützlich & billig)
-    function getTimestampFromTweetId(tweetId) {
-        const TWITTER_EPOCH = 1288834974657n;
-        return Number((BigInt(tweetId) >> 22n) + TWITTER_EPOCH);
+    let hoursDiff;
+    const mapDistance = getMapDistanceToTarget(lastReadPost);
+    const fineZoneActive = isSearchFineZoneActive(mapDistance);
+    if (fineZoneActive) {
+        step = CONFIG.SLOW_SEARCH_FINE_STEP_PX;
+        scrollState.isSlowScrollMode = true;
     }
-
-    const targetTimestamp = getTimestampFromTweetId(lastReadPost.tweetId);
-    const allLoadedPosts = Array.from(document.querySelectorAll('article'));
-    const allLoadedIds = allLoadedPosts
-        .map(post => getPostTweetId(post))
-        .filter(id => id && !isNaN(id))
-        .map(id => BigInt(id));
-
-    if (allLoadedIds.length > 0) {
-        const newestLoadedId = allLoadedIds.reduce((max, id) => (id > max ? id : max), allLoadedIds[0]);
-        const oldestLoadedId = allLoadedIds.reduce((min, id) => (id < min ? id : min), allLoadedIds[0]);
-        const newestTimestamp = getTimestampFromTweetId(newestLoadedId);
-        const oldestTimestamp = getTimestampFromTweetId(oldestLoadedId);
-        const timeDiffToTarget = Math.abs(targetTimestamp - newestTimestamp) || Math.abs(targetTimestamp - oldestTimestamp);
-        const hoursDiff = timeDiffToTarget / (3600 * 1000);
-        let distanceFactor = Math.min(hoursDiff * 2, 10);
-        // Cap um nach "viele Beiträge von neu abonniertem User" (hohe Neueste-IDs) nicht weit über die alte Lesestelle hinauszuschießen
+    if (mapDistance !== null && mapDistance > 12) {
+        scrollState.isSlowScrollMode = false;
+    }
+    if (mapDistance !== null && mapDistance > 0 && !fineZoneActive) {
+        let distanceFactor = Math.min(mapDistance / 5, 10);
         distanceFactor = Math.min(distanceFactor, CONFIG.MAX_SEARCH_DISTANCE_FACTOR);
+        if (mapDistance > 12) {
+            distanceFactor = Math.max(distanceFactor, 2.5);
+        }
         step *= distanceFactor;
-        debugLog('Search', `Distanz-Faktor: ${distanceFactor.toFixed(2)} (Stunden: ${hoursDiff.toFixed(2)})`);
+        hoursDiff = mapDistance / 4;
+        debugLog('Search', `Landkarten-Distanz-Faktor: ${distanceFactor.toFixed(2)} (idx-Abstand: ${mapDistance}, Snapshot: ${!!scrollState.mapSnapshotOrderedKeys})`);
     }
 
     // Absoluter Cap auf Schrittgröße.
@@ -2473,11 +4706,7 @@
     const sign = step < 0 ? -1 : 1;
     step = sign * Math.min(Math.abs(step), maxStep);
 
-    // Hinweis: Die frühere asynchrone "Dichte-Schätzung" aus der History wurde entfernt,
-    // weil sie als fire-and-forget IIFE in jedem Scroll-Schritt lief, den Faktor fast nie
-    // rechtzeitig anwendete und die Konsole zugespammt hat. Der ID-basierte Distanz-Faktor
-    // oben erfüllt den gleichen Zweck (größere Sprünge bei weit entfernten Zielen) synchron
-    // und zuverlässig.
+    // Landkarten-Index-Abstand steuert Scroll-Schrittgröße (größere Sprünge bei weit entfernten Zielen).
 
     if (scrollState.searchDirection === 'up') {
         step = -step;
@@ -2485,8 +4714,8 @@
     if (!scrollState.isSlowScrollMode) {
         scrollState.largeScrollCount++;
 
-        // (früherer toter Code "(1) > 1" wurde entfernt)
-        if (scrollState.largeScrollCount >= scrollState.maxLargeScrolls) {
+        const inCoarsePhase = mapDistance !== null && mapDistance > 12;
+        if (!inCoarsePhase && scrollState.largeScrollCount >= scrollState.maxLargeScrolls) {
             scrollState.isSlowScrollMode = true;
             debugLog('Search', 'Max große Scrolls erreicht → Wechsel zu Slow-Scroll-Mode');
         }
@@ -2495,34 +4724,165 @@
     return step;
 }
 
+    function getPostOffsetDeviation(element) {
+        if (!element?.getBoundingClientRect) return Infinity;
+        return Math.abs(element.getBoundingClientRect().top - CONFIG.RESTORE_SCROLL_OFFSET);
+    }
+
+    function isPostAtReadingOffset(element, tolerance = CONFIG.POSITION_CORRECTION_TOLERANCE) {
+        return getPostOffsetDeviation(element) <= tolerance;
+    }
+
+    function topPostMatchesBookmark(topPost, bookmark) {
+        if (!topPost || !bookmark?.tweetId) return false;
+        const tweetId = getPostTweetId(topPost);
+        const authorHandler = getPostAuthorHandler(topPost);
+        return tweetId === bookmark.tweetId &&
+            authorHandler === bookmark.authorHandler &&
+            !!isRepost(topPost) === !!bookmark.isRepost;
+    }
+
+    function isReadingPositionAtTargetOffset(bookmark = lastReadPost) {
+        const restoreBookmark = snapshotReadingBookmark(bookmark);
+        if (!restoreBookmark) return false;
+        const anchorPost = getPostAtReadingOffset(150) || getTopVisiblePost();
+        return !!(anchorPost &&
+            topPostMatchesBookmark(anchorPost, restoreBookmark) &&
+            isPostAtReadingOffset(anchorPost));
+    }
+
+    function logNewPostsAutoLoadPausedOnce() {
+        const now = Date.now();
+        if (now - newPostsState.lastPausedLogAt < 60000) return;
+        newPostsState.lastPausedLogAt = now;
+        debugLog('NewPosts', `Top-Post am Ziel-Offset (${CONFIG.RESTORE_SCROLL_OFFSET}px) — Auto-Laden pausiert`);
+        diagPush('NEWPOSTS_ALREADY_POSITIONED', 'info', 'Auto-Laden pausiert (bereits am Offset)', {
+            snapshot: diagSnapshot(),
+        });
+    }
+
+    function isNewPostsAutoLoadPaused() {
+        if (!isNearTimelineTop()) {
+            newPostsState.autoLoadPaused = false;
+            return false;
+        }
+        // Lesestelle am Ziel-Offset: pausieren, auch wenn darüber neuere Posts sichtbar sind
+        // (erwartet nach erfolgreichem New-Posts-Restore — sonst Doppel-Klick-Schleife).
+        if (isReadingPositionAtTargetOffset()) {
+            if (!newPostsState.autoLoadPaused) {
+                newPostsState.autoLoadPaused = true;
+                logNewPostsAutoLoadPausedOnce();
+            }
+            return true;
+        }
+        if (findNewestVisiblePostNewerThanBookmark(lastReadPost)) {
+            newPostsState.autoLoadPaused = false;
+            return false;
+        }
+        newPostsState.autoLoadPaused = false;
+        return false;
+    }
+
+    function tryAutoClickNewPosts() {
+        if (!isScriptActivated ||
+            searchControl.isSearching ||
+            searchControl.isFallbackSearching ||
+            searchControl.isAutoScrolling ||
+            searchControl.newPostsRestoreActive ||
+            !isNearTimelineTop()) {
+            return;
+        }
+        if (Date.now() - newPostsState.lastRestoreCompletedAt < 6000) {
+            return;
+        }
+        if (isNewPostsAutoLoadPaused()) {
+            return;
+        }
+        const indicator = getNewPostsIndicator();
+        if (indicator && indicator.dataset.processed !== 'true') {
+            clickNewPostsIndicator();
+        }
+    }
+
+    function finishPostHighlightAtOffset(element, anchorTweetId, anchorAuthor, onComplete, reason) {
+        if (isScrollAnchorStale(anchorTweetId, anchorAuthor)) {
+            debugLog('Position', 'Scroll-Highlight abgebrochen — Lesestelle wurde zwischendurch aktualisiert');
+            searchControl.isAutoScrolling = false;
+            scrollState.programmaticScrollEndedAt = Date.now();
+            syncHighlightIfDrifted();
+            if (onComplete) onComplete();
+            return;
+        }
+        const freshPost = resolveFreshPostElement(element, anchorTweetId, anchorAuthor) || element;
+        debugLog('Position', reason);
+        searchControl.isAutoScrolling = false;
+        scrollState.programmaticScrollEndedAt = Date.now();
+        updateHighlightedPost(freshPost);
+        applyHighlightToPost(freshPost);
+        if (anchorTweetId && anchorAuthor) {
+            scheduleHighlightRetries(anchorTweetId, anchorAuthor, [0, 300, 900, 2000, 3500]);
+        }
+        if (onComplete) onComplete();
+    }
+
     function scrollToPostWithHighlight(post, onComplete = null) {
     if (!post) {
         log('Search', 'Kein Beitrag zum Scrollen.');
-        searchControl.isSearching = false;
+        endManualSearchSession();
         searchControl.isFallbackSearching = false;
         if (onComplete) onComplete();
         return;
     }
     const anchorTweetId = getPostTweetId(post);
     const anchorAuthor = getPostAuthorHandler(post);
+    if (isScrollAnchorStale(anchorTweetId, anchorAuthor)) {
+        debugLog('Position', 'Scroll übersprungen — Lesestelle wurde vor Positionierung aktualisiert');
+        searchControl.isAutoScrolling = false;
+        syncHighlightIfDrifted();
+        if (onComplete) onComplete();
+        return;
+    }
+    const activePostInitial = resolveFreshPostElement(post, anchorTweetId, anchorAuthor) || post;
+
+    if (isPostAtReadingOffset(activePostInitial)) {
+        finishPostHighlightAtOffset(
+            activePostInitial,
+            anchorTweetId,
+            anchorAuthor,
+            onComplete,
+            `Bereits am Ziel (rect.top≈${CONFIG.RESTORE_SCROLL_OFFSET}px, Δ=${Math.round(getPostOffsetDeviation(activePostInitial))}px) — kein Scroll`
+        );
+        return;
+    }
+
     searchControl.isAutoScrolling = true;
     const maxPositionAttempts = CONFIG.MAX_POSITION_ATTEMPTS;
     let positionAttempts = 0;
     let lastMeasuredTop = null;
     const tryPositionPost = () => {
-        // Special handling for the very first attempt: do a rough bring-into-view first.
-        // This dramatically improves success rate when the post is still far away after the fallback's searching jumps.
-        if (positionAttempts === 0) {
-            const roughRect = post.getBoundingClientRect();
-            const currentScroll = window.scrollY;
+        const activePost = resolveFreshPostElement(post, anchorTweetId, anchorAuthor) || post;
 
-            // Rough center the post in the lower third of the screen (fast, no smooth)
+        if (isPostAtReadingOffset(activePost)) {
+            doPrecisePositioning();
+            return;
+        }
+
+        // Grob-Scroll nur wenn der Post weit vom Ziel-Offset entfernt ist (nicht bei Top-Post ≈175px).
+        if (positionAttempts === 0) {
+            const roughRect = activePost.getBoundingClientRect();
+            const deviation = Math.abs(roughRect.top - CONFIG.RESTORE_SCROLL_OFFSET);
+            const roughScrollThreshold = Math.max(220, window.innerHeight * 0.22);
+
+            if (deviation < roughScrollThreshold) {
+                doPrecisePositioning();
+                return;
+            }
+
+            const currentScroll = window.scrollY;
             const roughTarget = currentScroll + roughRect.top - (window.innerHeight * 0.55);
             window.scrollTo({ top: roughTarget, behavior: 'auto' });
 
-            // Give the browser and feed time to settle after the rough scroll + any ongoing mutations
             setTimeout(() => {
-                // Now proceed with the normal precise measurement as attempt 0
                 doPrecisePositioning();
             }, 900);
             return;
@@ -2532,11 +4892,7 @@
     };
 
     const finishPositioning = (reason) => {
-        debugLog('Position', reason);
-        searchControl.isAutoScrolling = false;
-        const freshPost = resolveFreshPostElement(post, anchorTweetId, anchorAuthor);
-        updateHighlightedPost(freshPost || post);
-        if (onComplete) onComplete();
+        finishPostHighlightAtOffset(post, anchorTweetId, anchorAuthor, onComplete, reason);
     };
 
     const doPrecisePositioning = () => {
@@ -2545,13 +4901,24 @@
         const scrollY = window.scrollY;
         const offset = CONFIG.RESTORE_SCROLL_OFFSET;
         const targetY = scrollY + rect.top - offset;
+        const deviation = Math.abs(rect.top - offset);
 
-        debugLog('Position', `rect.top:${rect.top} scrollY:${scrollY} targetY:${targetY} Versuch:${positionAttempts+1}`);
+        debugLog('Position', `rect.top:${rect.top} scrollY:${scrollY} targetY:${targetY} Δ:${Math.round(deviation)} Versuch:${positionAttempts+1}`);
+
+        if (isScrollAnchorStale(anchorTweetId, anchorAuthor)) {
+            finishPostHighlightAtOffset(
+                activePost,
+                anchorTweetId,
+                anchorAuthor,
+                onComplete,
+                'Positionierung abgebrochen — Lesestelle hat sich geändert'
+            );
+            return;
+        }
 
         applyHighlightToPost(activePost);
 
-        // Post bereits am/über dem Ziel (z. B. rect.top=0) → nicht weiter nach oben scrollen
-        if (rect.top <= offset) {
+        if (deviation <= CONFIG.POSITION_CORRECTION_TOLERANCE) {
             finishPositioning(`Beitrag bereits nah am Ziel (rect.top=${rect.top}, Ziel=${offset}px).`);
             return;
         }
@@ -2561,12 +4928,11 @@
         setTimeout(() => {
             const freshPost = resolveFreshPostElement(post, anchorTweetId, anchorAuthor) || post;
             const newRect = freshPost.getBoundingClientRect();
-            const deviation = Math.abs(newRect.top - offset);
-            const isWellPositioned = deviation <= CONFIG.POSITION_CORRECTION_TOLERANCE
-                || newRect.top <= offset;
+            const postDeviation = Math.abs(newRect.top - offset);
+            const isWellPositioned = postDeviation <= CONFIG.POSITION_CORRECTION_TOLERANCE;
             const isStuckAtTop = lastMeasuredTop !== null
                 && Math.abs(newRect.top - lastMeasuredTop) < 2
-                && newRect.top <= offset + 5;
+                && postDeviation <= CONFIG.POSITION_CORRECTION_TOLERANCE + 5;
 
             if (isWellPositioned || isStuckAtTop) {
                 finishPositioning(`Beitrag positioniert (rect.top=${newRect.top}, Ziel=${offset}px).`);
@@ -2587,176 +4953,16 @@
     tryPositionPost();
 }
 
-        async function findAndSetClosestPost() {
-    searchControl.isFallbackSearching = true;
-    searchControl.isSearchCancelled = false;
-
-    // Auch im Fallback sauberen State sicherstellen (kann aus automatischer Suche nach New-Posts kommen)
-    scrollState.scrollCyclePhase = 0;
-    scrollState.hasCompletedCycle = false;
-    scrollState.stagnantScrollCount = 0;
-    scrollState.largeScrollCount = 0;
-    scrollState.isSlowScrollMode = false;
-    scrollState.searchDirection = 'down';
-    scrollState.lastScrollHeight = 0;
-
-    if (!lastReadPost || !lastReadPost.tweetId || !lastReadPost.timestamp) {
-        log('Fallback', 'Keine gültige Leseposition für Fallback-Suche.');
-        showPopup('tweetIdNotFound', 5000);
-        searchControl.isFallbackSearching = false;
-        return;
+    async function findAndSetClosestPost() {
+        scrollState.scrollCyclePhase = 0;
+        scrollState.hasCompletedCycle = false;
+        scrollState.stagnantScrollCount = 0;
+        scrollState.largeScrollCount = 0;
+        scrollState.isSlowScrollMode = false;
+        scrollState.searchDirection = 'down';
+        scrollState.lastScrollHeight = 0;
+        await landReadingPositionFromResolve('legacy-fallback');
     }
-
-    const targetTime = new Date(lastReadPost.timestamp).getTime();
-    const targetId = BigInt(lastReadPost.tweetId);
-    if (!popup) {
-        popup = createSearchPopup(lastReadPost);
-    } else {
-        updateActionPopup('tweetIdNotFound', {
-            authorHandler: lastReadPost.authorHandler,
-            tweetId: lastReadPost.tweetId
-        });
-    }
-    if (!popup) {
-        log('Search', 'Popup konnte nicht erstellt werden.');
-        searchControl.isFallbackSearching = false;
-        return;
-    }
-
-    function handleSpaceKey(event) {
-        if (event.code === 'Space' && (searchControl.isSearching || searchControl.isFallbackSearching)) {
-            searchControl.isSearchCancelled = true;
-            dismissActionPopup();
-            showPopup('fallbackSearchCancelled', 5000);
-            debugLog('Fallback', 'Suche gestoppt durch Benutzer.');
-            searchControl.isSearching = false;
-            searchControl.isFallbackSearching = false;
-            window.removeEventListener('keydown', handleSpaceKey);
-        }
-    }
-    window.addEventListener('keydown', handleSpaceKey);
-
-    let attempts = 0;
-    const maxAttempts = CONFIG.MAX_FALLBACK_ATTEMPTS;
-
-    while (attempts < maxAttempts) {
-        if (searchControl.isSearchCancelled) {
-            debugLog('Fallback', 'Suche abgebrochen durch Benutzer.');
-            searchControl.isFallbackSearching = false;
-            dismissActionPopup();
-            window.removeEventListener('keydown', handleSpaceKey);
-            return;
-        }
-
-        const allLoadedPosts = Array.from(document.querySelectorAll('article')).map(post => ({
-            element: post,
-            tweetId: getPostTweetId(post),
-            timestamp: getPostTimestamp(post),
-            authorHandler: getPostAuthorHandler(post),
-            isRepost: isRepost(post)
-        })).filter(p => p.tweetId && p.timestamp && !isNaN(new Date(p.timestamp).getTime())).map(p => ({
-            ...p,
-            bigId: BigInt(p.tweetId),
-            postTime: new Date(p.timestamp).getTime()
-        }));
-
-        if (allLoadedPosts.length === 0) {
-            debugLog('Fallback', 'Keine geladenen Posts, warte...');
-            await new Promise(resolve => setTimeout(resolve, 1200));
-            attempts++;
-            continue;
-        }
-
-        let closest = allLoadedPosts.reduce((prev, curr) => {
-            const prevDiff = Math.abs(prev.postTime - targetTime);
-            const currDiff = Math.abs(curr.postTime - targetTime);
-            return currDiff < prevDiff ? curr : prev;
-        });
-
-        const timeDiff = Math.abs(closest.postTime - targetTime);
-
-        // Machen wir den Fallback deutlich hartnäckiger:
-        // Wir wollen den Post wirklich nah ans Viewport bringen, nicht nur "irgendwas innerhalb 1 Stunde" akzeptieren.
-        const isVisuallyClose = Math.abs(closest.element.getBoundingClientRect().top) < window.innerHeight * 1.5;
-
-        if ((timeDiff < 3600000 && isVisuallyClose) || attempts > 20) {
-            // Sehr robuste finale "Bring this specific post close to viewport" Phase
-            // Wir machen mehrere kontrollierte, mittelgroße Scrolls mit Wartezeiten,
-            // bis der gewählte Post wirklich in einem guten Bereich des Viewports liegt.
-            // Das verhindert den "einen großen Sprung und dann Stopp ohne richtige Zentrierung".
-            let bringAttempts = 0;
-            const maxBringAttempts = 7;
-
-            while (bringAttempts < maxBringAttempts) {
-                const currentRect = closest.element.getBoundingClientRect();
-                const currentTop = currentRect.top;
-
-                // Wenn der Post schon gut liegt (zwischen ca. RESTORE_SCROLL_OFFSET und 380px vom oberen Rand), aufhören.
-                if (currentTop > CONFIG.RESTORE_SCROLL_OFFSET && currentTop < 380) {
-                    break;
-                }
-
-                // Kontrollierter Schritt in die richtige Richtung
-                const step = (currentTop > 380) ? -window.innerHeight * 0.5 : window.innerHeight * 0.4;
-                window.scrollBy({ top: step, behavior: 'smooth' });
-
-                await new Promise(resolve => setTimeout(resolve, 950)); // Wartezeit für Stabilisierung
-                bringAttempts++;
-            }
-
-            const fallbackTweetId = closest.tweetId;
-            const fallbackAuthor = closest.authorHandler;
-
-            await new Promise(resolve => scrollToPostWithHighlight(closest.element, resolve));
-
-            let finalAttempts = 0;
-            const maxFinalAttempts = 4;
-            while (finalAttempts < maxFinalAttempts) {
-                const freshClosest = resolveFreshPostElement(closest.element, fallbackTweetId, fallbackAuthor);
-                if (!freshClosest) break;
-
-                const finalRect = freshClosest.getBoundingClientRect();
-                const finalDeviation = Math.abs(finalRect.top - CONFIG.RESTORE_SCROLL_OFFSET);
-
-                if (finalDeviation <= CONFIG.FALLBACK_POSITION_TOLERANCE || finalRect.top <= CONFIG.RESTORE_SCROLL_OFFSET) {
-                    break;
-                }
-
-                const correction = (finalRect.top - CONFIG.RESTORE_SCROLL_OFFSET) * 0.7;
-                window.scrollBy({ top: -correction, behavior: 'smooth' });
-                await new Promise(resolve => setTimeout(resolve, 700));
-                finalAttempts++;
-            }
-
-            const freshFallbackElement = resolveFreshPostElement(closest.element, fallbackTweetId, fallbackAuthor);
-            await adoptFallbackPost(freshFallbackElement || closest.element);
-
-            log('Search', `Zeitlich nächsten Post gefunden (Diff: ${Math.round(timeDiff / 60000)} min) — Fallback.`);
-            dismissActionPopup();
-            showPopup('postDeletedFallback', 8000);
-            searchControl.isFallbackSearching = false;
-            window.removeEventListener('keydown', handleSpaceKey);
-            return;
-        }
-
-        // Weniger aggressive Sprünge im Fallback, damit der User nicht das Gefühl hat "großer Sprung und dann Stopp"
-        const scrollStep = (attempts % 3 === 0) 
-            ? -window.innerHeight * 0.75 
-            : window.innerHeight * 0.65;
-
-        window.scrollBy({ top: scrollStep, behavior: 'smooth' });
-        await new Promise(resolve => setTimeout(resolve, 1600));
-        attempts++;
-
-        debugLog('Fallback', `Versuch ${attempts}/${maxAttempts}, Zeit-Diff: ${Math.round(timeDiff / 60000)} min`);
-    }
-
-    log('Search', 'Maximale Versuche erreicht, keine passende Position gefunden.');
-    dismissActionPopup();
-    showPopup('tweetIdNotFound', 8000);
-    searchControl.isFallbackSearching = false;
-    window.removeEventListener('keydown', handleSpaceKey);
-}
 
     function createSearchPopup(position) {
     const messageKey = searchControl.isFallbackSearching ? 'tweetIdNotFound' : 'searchPopup';
@@ -2797,12 +5003,28 @@
         const indicator = getNewPostsIndicator();
         if (indicator) {
             if (isNearTimelineTop()) {
-                log('NewPosts', 'Indicator erkannt – Auto-Click in 600ms (nach Lesestellen-Prüfung)');
-                setTimeout(() => { clickNewPostsIndicator(); }, 600);
+                if (isNewPostsAutoLoadPaused()) {
+                    debugLog('NewPosts', 'Indicator gesehen — Auto-Click pausiert (bereits am Offset, warte auf neuere Posts).');
+                    return;
+                }
+                debugLog('NewPosts', 'Indicator erkannt – Auto-Click in 600ms (nach Lesestellen-Prüfung)');
+                setTimeout(() => {
+                    if (searchControl.manualSearchActive) {
+                        debugLog('NewPosts', 'Auto-Click übersprungen — manuelle Suche aktiv.');
+                        return;
+                    }
+                    if (searchControl.newPostsRestoreActive) {
+                        debugLog('NewPosts', 'Auto-Click übersprungen — Restore läuft.');
+                        diagBlocked('GUARD_OBSERVER_DEBOUNCE', 'Observer-Auto-Click während Restore blockiert');
+                        return;
+                    }
+                    tryAutoClickNewPosts();
+                }, 600);
+                window.newPostsObserver.disconnect();
             } else {
                 debugLog('NewPosts', 'Indicator gesehen bei scrollY=' + Math.round(window.scrollY) + ' – ignoriert (nicht nah am Top, kein Auto-Laden).');
+                window.newPostsObserver.disconnect();
             }
-            window.newPostsObserver.disconnect();
         }
     });
 
@@ -2885,18 +5107,22 @@
 }
 
     async function ensureViewportLesestelleBeforeNewPosts() {
+        if (searchControl.manualSearchActive) {
+            debugLog('NewPosts', 'Lesestellen-Sync übersprungen — manuelle Suche aktiv.');
+            return false;
+        }
         if (!window.location.href.includes('/home')) return true;
 
-        const topPost = getTopVisiblePost();
-        if (!topPost) {
+        const anchorPost = getLesestelleAnchorPost();
+        if (!anchorPost) {
             log('NewPosts', 'Kein Post im Viewport – Neue Beiträge zurückgestellt');
             return false;
         }
 
-        const tweetId = getPostTweetId(topPost);
-        const authorHandler = getPostAuthorHandler(topPost);
-        const timestamp = getPostTimestamp(topPost);
-        const repostFlag = isRepost(topPost);
+        const tweetId = getPostTweetId(anchorPost);
+        const authorHandler = getPostAuthorHandler(anchorPost);
+        const timestamp = getPostTimestamp(anchorPost);
+        const repostFlag = isRepost(anchorPost);
 
         if (!tweetId || !authorHandler || !timestamp) {
             log('NewPosts', 'Top-Post im Viewport unvollständig – Neue Beiträge zurückgestellt');
@@ -2909,23 +5135,47 @@
             !!lastReadPost.isRepost === repostFlag;
 
         if (matchesCurrent) {
-            debugLog('NewPosts', `Lesestelle = Top-Post (@${authorHandler} ${tweetId})`);
+            const logKey = `${tweetId}-${authorHandler}-${repostFlag}`;
+            if (newPostsState.lastLesestelleLogKey !== logKey) {
+                newPostsState.lastLesestelleLogKey = logKey;
+                debugLog('NewPosts', `Lesestelle = Top-Post (@${authorHandler} ${tweetId})`);
+            }
             return true;
         }
 
-        log('NewPosts', `Lesestelle weicht ab – setze @${authorHandler} ${tweetId} vor Neue-Beiträge`);
+        const viewportCandidate = {
+            tweetId,
+            authorHandler,
+            timestamp,
+            isRepost: repostFlag
+        };
+
+        if (lastReadPost?.tweetId && BigInt(tweetId) < BigInt(lastReadPost.tweetId)) {
+            // Am Timeline-Top ist ein älterer Viewport erwartbar (hochgescrollt, Lesestelle tiefer).
+            // Bookmark wird in clickNewPostsIndicator eingefroren — kein Sync, aber Laden erlauben.
+            if (isNearTimelineTop()) {
+                debugLog('NewPosts',
+                    `Viewport-Top (@${authorHandler} ${tweetId}) älter als Lesestelle (@${lastReadPost.authorHandler} ${lastReadPost.tweetId}) — am Top OK, Bookmark wird eingefroren.`);
+                return true;
+            }
+            log('NewPosts', `Viewport-Top (@${authorHandler} ${tweetId}) ist älter als Lesestelle (@${lastReadPost.authorHandler} ${lastReadPost.tweetId}) — kein Auto-Laden/Restore.`);
+            diagPush('BOOKMARK_OLDER_SKIPPED', 'warn',
+                'Viewport-Top ist älter als Lesestelle — kein Sync vor New-Posts', {
+                    viewport: diagBookmark(viewportCandidate),
+                    bookmark: diagBookmark(lastReadPost),
+                    snapshot: diagSnapshot(),
+                });
+            return false;
+        }
+
+        log('NewPosts', `Lesestelle weicht ab – synchronisiere @${authorHandler} ${tweetId} vor Neue-Beiträge`);
 
         suppressionState.until = 0;
         suppressionState.pastTweetId = null;
-        await markTopVisiblePost(true);
 
-        const matchesAfterMark = lastReadPost &&
-            lastReadPost.tweetId === tweetId &&
-            lastReadPost.authorHandler === authorHandler &&
-            !!lastReadPost.isRepost === repostFlag;
-
-        if (!matchesAfterMark) {
+        if (isCandidateNewer(viewportCandidate, lastReadPost)) {
             const account = await getCurrentUserHandle();
+            invalidateHighlightRetries();
             lastReadPost = {
                 tweetId,
                 authorHandler,
@@ -2935,7 +5185,11 @@
                 readAt: new Date().toISOString()
             };
             await saveLastReadPost(lastReadPost);
+            updateHighlightedPost();
             log('Save', 'Lesestelle vor New-Posts synchronisiert: @' + authorHandler, tweetId);
+            diagPush('BOOKMARK_OVERWRITE', 'info', 'Lesestelle vor New-Posts aktualisiert', {
+                newBookmark: diagBookmark(lastReadPost),
+            });
         }
 
         return true;
@@ -2943,61 +5197,162 @@
 
     async function clickNewPostsIndicator() {
 
+    if (searchControl.manualSearchActive) {
+        debugLog('NewPosts', 'Neue Beiträge übersprungen — manuelle Suche aktiv.');
+        diagBlocked('GUARD_MANUAL_SEARCH', 'New-Posts während manueller Suche blockiert');
+        return;
+    }
+
+    if (searchControl.newPostsRestoreActive) {
+        debugLog('NewPosts', 'New-Posts-Restore läuft — Auto-Click übersprungen.');
+        diagBlocked('GUARD_RESTORE_RUNNING', 'Doppelter New-Posts-Klick blockiert (Restore läuft)');
+        return;
+    }
+
+    if (isNewPostsAutoLoadPaused() || isReadingPositionAtTargetOffset()) {
+        if (!newPostsState.autoLoadPaused) {
+            newPostsState.autoLoadPaused = true;
+            logNewPostsAutoLoadPausedOnce();
+        }
+        return;
+    }
+
     const ready = await ensureViewportLesestelleBeforeNewPosts();
     if (!ready) {
-        searchControl.isSearching = false;
+        return;
+    }
+
+    // Snapshot NACH Viewport-Sync: ensureViewport kann lastReadPost auf den
+    // aktuell sichtbar-neuesten Post heben — ein früherer Snapshot würde sonst
+    // nach New-Posts auf einen älteren Post zurückspringen (frozen ≠ live).
+    const restoreBookmark = snapshotReadingBookmark();
+    if (!restoreBookmark) {
+        debugLog('NewPosts', 'Kein Bookmark — Neue Beiträge übersprungen.');
+        diagBlocked('GUARD_NO_BOOKMARK', 'New-Posts ohne gespeichertes Bookmark blockiert');
+        return;
+    }
+
+    if (isReadingPositionAtTargetOffset(restoreBookmark)) {
+        newPostsState.autoLoadPaused = true;
+        return;
+    }
+
+    const viewportAnchor = getLesestelleAnchorPost();
+    const viewportTweetId = viewportAnchor ? getPostTweetId(viewportAnchor) : null;
+    if (viewportTweetId && restoreBookmark?.tweetId &&
+        BigInt(viewportTweetId) < BigInt(restoreBookmark.tweetId) &&
+        !isNearTimelineTop()) {
+        debugLog('NewPosts', 'Auto-Laden übersprungen — Viewport zeigt älteren Post als Lesestelle.');
+        diagBlocked('GUARD_VIEWPORT_OLDER', 'New-Posts blockiert (Viewport älter als Bookmark)');
         return;
     }
 
     const btn = getNewPostsIndicator();
     if (!btn) {
         debugLog('NewPosts', 'Kein Button gefunden');
-        searchControl.isSearching = false;
         return;
     }
 
+    const postsBeforeNewPosts = snapshotLoadedPostKeys();
+    debugLog('NewPosts', `Baseline vor Laden: ${postsBeforeNewPosts.size} Posts im DOM`);
+
+    searchControl.newPostsRestoreActive = true;
     searchControl.isSearching = true;
+    diagBeginFlow('new-posts-restore', { frozenBookmark: diagBookmark(restoreBookmark) });
+    diagPush('BOOKMARK_FROZEN', 'info', 'Restore-Bookmark eingefroren', {
+        frozen: diagBookmark(restoreBookmark),
+        live: diagBookmark(lastReadPost),
+    });
+    const domBaseline = {
+        baselinePostCount: document.querySelectorAll('article').length,
+        baselineCellCount: document.querySelectorAll("div[data-testid='cellInnerDiv']").length,
+        baselineScrollHeight: document.body.scrollHeight || document.documentElement.scrollHeight,
+    };
+
     btn.dataset.processed = 'true';
     btn.click();
 
     log('NewPosts', 'Button automatisch geklickt');
+    debugLog('Restore', `Bookmark eingefroren für Restore: @${restoreBookmark.authorHandler} ${restoreBookmark.tweetId}`);
+    newPostsState.autoLoadPaused = false;
     pendingNewPosts = 0;
     suppressionState.until = Date.now() + CONFIG.NEW_POSTS_GRACE_MS;
     scrollState.hasScrolledUp = false; // Nach Feed-Sprung durch "Neue Beiträge" kein automatisches Hochscrollen annehmen
 
     // === Wichtiger Pfad: Nach automatischem Laden neuer Beiträge die letzte Lesestelle wiederherstellen ===
-    if (lastReadPost && lastReadPost.tweetId) {
-        log('Restore', 'Nach neuen Beiträgen: Warte auf DOM-Stabilisierung und versuche letzte Lesestelle wiederherzustellen...');
+    log('Restore', 'Nach neuen Beiträgen: Warte auf DOM-Stabilisierung und versuche letzte Lesestelle wiederherzustellen...');
 
-        waitForNewPosts(() => {
-            // Etwas mehr Zeit für Layout nach neuen Posts (Bilder, Zitate, etc. verändern noch Positionen)
-            setTimeout(() => {
-                const posts = Array.from(document.querySelectorAll('article'));
-                const foundPost = posts.find(post => {
-                    const tweetId = getPostTweetId(post);
-                    const author = getPostAuthorHandler(post);
-                    return tweetId === lastReadPost.tweetId && author === lastReadPost.authorHandler;
+    waitForNewPosts(() => {
+        setTimeout(async () => {
+            try {
+                const resolved = await restoreReadingPositionAfterNewPosts(restoreBookmark, postsBeforeNewPosts);
+                if (!resolved) {
+                    diagPush('NEWPOSTS_EMPTY_FEED', 'error', 'Kein Treffer nach New-Posts Scroll-Restore', {
+                        frozen: diagBookmark(restoreBookmark),
+                        snapshot: diagSnapshot(),
+                    });
+                    showPopup('tweetIdNotFound', 6000, {
+                        authorHandler: restoreBookmark.authorHandler,
+                        tweetId: restoreBookmark.tweetId
+                    });
+                    diagEndFlow('fail', 'NEWPOSTS_NO_RESOLVE', 'Weder Lesestelle noch neue Posts');
+                    return;
+                }
+
+                const adopt = resolved.adopt === true || resolved.strategy === 'new-posts-oldest';
+                log('Restore', `New-Posts Restore (${resolved.strategy}, adopt=${adopt}) → @${resolved.post.authorHandler} ${resolved.post.tweetId}`);
+                const landingOk = await applyResolvedReadingPosition(resolved, {
+                    adopt,
+                    expectedBookmark: restoreBookmark,
+                    verifySource: 'new-posts-restore',
                 });
 
-                if (foundPost) {
-                    log('Restore', 'Letzte Lesestelle nach New-Posts direkt im DOM gefunden → markiere + zentriere.');
-                    scrollToPostWithHighlight(foundPost);
-                    searchControl.isSearching = false;
-                } else {
-                    log('Restore', 'Letzte Lesestelle nach New-Posts nicht direkt sichtbar → starte Fallback-Suche.');
-                    if (searchControl.isFallbackSearching) searchControl.isFallbackSearching = false;
-
-                    // Nach Laden vieler neuer Beiträge (z.B. neu abonniertes Konto mit hoher Post-Frequenz)
-                    // konservativ starten: Slow-Mode + zurückgesetzter largeScrollCount, damit calculateScrollStep
-                    // keine riesigen Sprünge macht und nicht weit über die alte Lesestelle hinausschießt.
-                    scrollState.isSlowScrollMode = true;
-                    scrollState.largeScrollCount = 0;
-                    scrollState.scrollCyclePhase = 0;
-                    startRefinedSearchForLastReadPost();
+                const popupKey = getResolvePopupKey(resolved);
+                if (popupKey) {
+                    const lang = getUserLanguage();
+                    showPopup(popupKey, 5000, {
+                        strategy: getResolveStrategyLabel(resolved.strategy, lang)
+                    });
                 }
-            }, 400); // extra kleine Wartezeit für stabileres Layout nach neuen Posts
-        });
-    }
+
+                if (landingOk) {
+                    newPostsState.lastRestoreCompletedAt = Date.now();
+                    updateTimelineMap('new-posts-restore', 'up');
+                    if (resolved.strategy === 'exact' && isReadingPositionAtTargetOffset(restoreBookmark)) {
+                        newPostsState.autoLoadPaused = true;
+                    }
+                    diagEndFlow('ok', 'NEWPOSTS_RESTORE_OK', 'Restore abgeschlossen', {
+                        strategy: resolved.strategy,
+                        frozen: diagBookmark(restoreBookmark),
+                    });
+                } else {
+                    diagEndFlow('fail', 'NEWPOSTS_RESTORE_FAIL', 'Restore ohne gültiges Landing');
+                }
+            } catch (err) {
+                log('Restore', 'Fehler beim New-Posts Restore:', err);
+                diagPush('NEWPOSTS_RESTORE_ERROR', 'error', String(err?.message || err), {
+                    frozen: diagBookmark(restoreBookmark),
+                    snapshot: diagSnapshot(),
+                });
+                await landReadingPositionFromResolve('new-posts-error', restoreBookmark);
+                diagEndFlow('fail', 'NEWPOSTS_RESTORE_EXCEPTION', 'Restore mit Exception beendet');
+            } finally {
+                searchControl.isSearching = false;
+                searchControl.newPostsRestoreActive = false;
+                flushDeferredTimelineMapUpdate('new-posts-restore');
+                lastScrollY = window.scrollY;
+                scrollState.lastMapScrollY = window.scrollY;
+                setTimeout(() => {
+                    updateHighlightedPost();
+                }, 500);
+            }
+        }, 400);
+    }, {
+        ...domBaseline,
+        aggressiveScroll: false,
+        fallbackMs: 3000,
+        settleMs: 1200,
+    });
 
     setTimeout(observeForNewPosts, 800);
 }
