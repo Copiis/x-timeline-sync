@@ -6,7 +6,7 @@ Tampermonkey-Userscript für **x.com** — Leseposition in der Timeline merken u
 |---|---|
 | **Tampermonkey (DE)** | X Leseposition & Medien-Download |
 | **Tampermonkey (EN)** | X Reading Position & Media Download |
-| **Aktuelle Version** | `2026.6.28i` |
+| **Aktuelle Version** | `2026.6.28j` |
 
 ## Installation
 
@@ -15,7 +15,7 @@ Tampermonkey-Userscript für **x.com** — Leseposition in der Timeline merken u
 **Direkt von GitHub (Raw-URL):**
 
 ```
-https://raw.githubusercontent.com/Copiis/x-timeline-sync/master/Twitter-X-Timeline-Sync.js
+https://raw.githubusercontent.com/Copiis/x-leseposition-medien-download/master/Twitter-X-Timeline-Sync.js
 ```
 
 Tampermonkey, Violentmonkey oder Greasemonkey installieren → Link oben öffnen → Script installieren.
@@ -40,7 +40,7 @@ Leseposition-Sync aktiv auf **x.com/home**; schwebende Buttons links unten (Lupe
 
 ## Quelle
 
-**GitHub (einzige Spiegelung):** https://github.com/Copiis/x-timeline-sync
+**GitHub (einzige Spiegelung):** https://github.com/Copiis/x-leseposition-medien-download
 
 ## Entwicklung
 
@@ -53,7 +53,7 @@ Leseposition-Sync aktiv auf **x.com/home**; schwebende Buttons links unten (Lupe
 **Code-Sync-URL:**
 
 ```
-https://raw.githubusercontent.com/Copiis/x-timeline-sync/master/Twitter-X-Timeline-Sync.js
+https://raw.githubusercontent.com/Copiis/x-leseposition-medien-download/master/Twitter-X-Timeline-Sync.js
 ```
 
 **Beschreibung (DE/EN):** Als Copiis einloggen → Bearbeiten → Name + „Zusätzliche Informationen“:
