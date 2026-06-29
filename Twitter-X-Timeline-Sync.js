@@ -15,7 +15,7 @@
 // @description:ko Twitter/X에서 마지막 읽기 위치를 추적하고 동기화합니다. 수동 및 자동 옵션 포함. 새로운 게시물을 확인하면서 현재 위치를 잃지 않도록 이상적입니다. 트윗 ID를 사용하여 정확한 위치 지정을 하고, 리포스트를 지원합니다。
 // @icon https://x.com/favicon.ico
 // @namespace https://github.com/Copiis/x-leseposition-medien-download
-// @version 2026.6.28j
+// @version 2026.6.29k
 // @author Copiis
 // @license MIT
 // @match https://x.com/*
@@ -101,6 +101,8 @@
         TIMELINE_MAP_DEBOUNCE_MS: 200,
         TIMELINE_MAP_PERSIST_MS: 30000,
         MAP_SCROLL_DIRECTION_THRESHOLD: 40,
+        SCROLL_UP_PROMOTE_COOLDOWN_MS: 500,
+        SCROLL_UP_SESSION_MS: 15000,
     };
 
     const repostCache = new WeakMap();
@@ -894,6 +896,8 @@
         // Neue Regel (User-Wunsch): Reposts dürfen nur als Lesestelle gespeichert werden,
         // wenn der User vorher aktiv nach oben gescrollt hat.
         hasScrolledUp: false,
+        lastScrollUpPromoteAt: 0,
+        scrollUpMaxTweetId: null,
         programmaticScrollEndedAt: 0,
         lastMapScrollY: 0,
         lastMapScrollDirection: 'neutral',
@@ -924,6 +928,7 @@
         lastPausedLogAt: 0,
         lastLesestelleLogKey: null,
         lastRestoreCompletedAt: 0,
+        restoreGraceUntil: 0,
     };
 
     function snapshotReadingBookmark(bookmark = lastReadPost) {
@@ -1446,9 +1451,14 @@
                 scrollState.hasScrolledUp = true;
                 mapScrollDir = 'up';
                 scrollState.lastMapScrollDirection = 'up';
+                if (!scrollState.scrollUpMaxTweetId && lastReadPost?.tweetId) {
+                    updateScrollUpMaxTweetId(lastReadPost.tweetId);
+                }
             } else if (window.scrollY > lastScrollY + CONFIG.MAP_SCROLL_DIRECTION_THRESHOLD) {
                 mapScrollDir = 'down';
                 scrollState.lastMapScrollDirection = 'down';
+                scrollState.lastScrollUpPromoteAt = 0;
+                scrollState.scrollUpMaxTweetId = null;
             }
             lastScrollY = window.scrollY;
             scrollState.lastMapScrollY = window.scrollY;
@@ -1627,7 +1637,7 @@
         return;
     }
 
-    log('Init', 'Initialisiere Skript auf /home... (Version 2026.6.28f)');
+    log('Init', 'Initialisiere Skript auf /home... (Version 2026.6.29k)');
     log('Init', 'Diag-Logging aktiv — bei Problemen Konsole filtern: Diag:ERROR | Diag:WARN | Diag:SESSION');
 
     const observer = new MutationObserver((mutations, obs) => {
@@ -1823,9 +1833,13 @@
         if (promoted) return;
     }
 
-    // Wichtiger Gedächtnis-Schritt: Timeline mit History abgleichen
-    // (siehe User-Vorschlag mit den letzten MAX_POST_HISTORY Einträgen)
-    reconcileLesestelleWithHistory();
+    // Gedächtnis-Abgleich — beim Hochscrollen pausieren (konkurriert mit tryPromote)
+    if (!shouldSkipCompetingLesestelleSync(dir)) {
+        reconcileLesestelleWithHistory();
+    } else {
+        debugLog('Save', 'Reconcile übersprungen: Hochscrollen/Cooldown aktiv');
+        syncHighlightIfDrifted();
+    }
 
     // Punkt 3 vereinfacht: kurzer Grace + sofortige Aufhebung sobald User zu neuerem Post scrollt
     if (save && suppressionState.until > 0) {
@@ -1886,7 +1900,30 @@
     if (knownMarkedKeys.has(positionKey) && !allowOlderRegression) {
         if (lastReadPost?.tweetId && postTweetId && postAuthorHandler && postTimestamp) {
             try {
-                if (BigInt(postTweetId) > BigInt(lastReadPost.tweetId)) {
+                const higherId = BigInt(postTweetId) > BigInt(lastReadPost.tweetId);
+                const repostScrollUp = shouldAllowOlderRepostOnScrollUp(
+                    anchorPost, postTweetId, postTimestamp, repostFlag, dir
+                );
+                const sessionBlocked = isScrollUpSessionActive() ||
+                    newPostsState.restoreGraceUntil > Date.now() ||
+                    searchControl.newPostsRestoreActive;
+                // Hochscrollen: bekannte normale Posts nicht per GM-Sync adoptieren
+                // (Promotion blockiert sie bereits — GM-Sync umging das nach Session-Timeout).
+                if ((sessionBlocked || (isScrollUpActive(dir) && !repostFlag)) && !repostScrollUp) {
+                    debugLog('Save', `GM-Sync übersprungen — Hochscroll/Restore-Session (${positionKey})`);
+                    syncHighlightIfDrifted();
+                    return;
+                }
+                if (sessionBlocked && isBlockedByScrollUpMaxTweetId({
+                    tweetId: postTweetId,
+                    authorHandler: postAuthorHandler
+                }, lastReadPost.tweetId)) {
+                    syncHighlightIfDrifted();
+                    return;
+                }
+                const gmSyncAllowed = (repostScrollUp || higherId) &&
+                    (!shouldSkipCompetingLesestelleSync(dir) || isAnchorTopVisiblePost(anchorPost));
+                if (gmSyncAllowed) {
                     if (isPostLupeProtectionActive()) {
                         debugLog('Restore', 'GM-Sync übersprungen — Post-Lupe-Schutz aktiv');
                         return;
@@ -1898,11 +1935,13 @@
                         authorHandler: postAuthorHandler,
                         isRepost: repostFlag,
                         account,
-                        readAt: new Date().toISOString()
+                        readAt: new Date().toISOString(),
+                        context: captureReadingContext(anchorPost)
                     };
                     await saveLastReadPost(lastReadPost, { force: true });
                     updateHighlightedPost();
-                    debugLog('Save', `GM-Sync: bekannter Post ${positionKey} ist neuer — Lesestelle aktualisiert`);
+                    debugLog('Save', `GM-Sync: bekannter Post ${positionKey} aktualisiert` +
+                        (repostScrollUp ? ' (Repost beim Hochscrollen)' : ' (neuere ID)'));
                     return;
                 }
             } catch (e) {
@@ -1951,8 +1990,12 @@
             const candId = BigInt(postTweetId);
             const lastId = BigInt(lastReadPost.tweetId);
             if (candId < lastId) {
-                debugLog('Save', `Gedächtnis-Schutz: ältere ID ${postTweetId} wird nicht automatisch übernommen (aktuelle Lesestelle: ${lastReadPost.tweetId})`);
-                save = false;
+                if (shouldAllowOlderRepostOnScrollUp(anchorPost, postTweetId, postTimestamp, repostFlag, dir)) {
+                    debugLog('Save', `Gedächtnis-Schutz: ältere Repost-ID ${postTweetId} beim Hochscrollen erlaubt`);
+                } else {
+                    debugLog('Save', `Gedächtnis-Schutz: ältere ID ${postTweetId} wird nicht automatisch übernommen (aktuelle Lesestelle: ${lastReadPost.tweetId})`);
+                    save = false;
+                }
             }
         }
 
@@ -2188,23 +2231,152 @@
         return best;
     }
 
-    /**
-     * Beim Hochscrollen: neueren sichtbaren Post oberhalb der Lesestelle sofort markieren.
-     * Umgeht Map/Reconcile-Verzögerung nach New-Posts-Restore (stale lastScrollY, Option-2-Skip).
-     */
-    async function tryPromoteNewerVisiblePostOnScrollUp(mapDirection) {
-        if (isLesestelleMutationBlocked()) return false;
-        if (mapDirection !== 'up' && !scrollState.hasScrolledUp) return false;
-        if (!lastReadPost?.tweetId) return false;
+    function isScrollUpActive(mapDirection = null) {
+        const dir = mapDirection || scrollState.lastMapScrollDirection || 'neutral';
+        return dir === 'up' || !!scrollState.hasScrolledUp;
+    }
 
-        const newer = findNewestVisiblePostNewerThanBookmark(lastReadPost);
-        if (!newer?.tweetId || !newer.authorHandler || !newer.timestamp) return false;
+    function isScrollUpCooldownActive() {
+        return scrollState.lastScrollUpPromoteAt > 0 &&
+            Date.now() - scrollState.lastScrollUpPromoteAt < CONFIG.SCROLL_UP_PROMOTE_COOLDOWN_MS;
+    }
+
+    function isScrollUpSessionActive() {
+        return scrollState.lastScrollUpPromoteAt > 0 &&
+            Date.now() - scrollState.lastScrollUpPromoteAt < CONFIG.SCROLL_UP_SESSION_MS;
+    }
+
+    /** Hochscroll-Phase: konkurrierende GM-Sync/Reconcile-Pfade pausieren. */
+    function shouldSkipCompetingLesestelleSync(mapDirection = null) {
+        return isScrollUpActive(mapDirection) || isScrollUpCooldownActive() || isScrollUpSessionActive();
+    }
+
+    function updateScrollUpMaxTweetId(tweetId) {
+        if (!tweetId) return;
+        try {
+            const id = BigInt(tweetId);
+            const cur = scrollState.scrollUpMaxTweetId ? BigInt(scrollState.scrollUpMaxTweetId) : BigInt(0);
+            if (id > cur) {
+                scrollState.scrollUpMaxTweetId = String(tweetId);
+            }
+        } catch (e) {
+            debugLog('Save', 'scrollUpMaxTweetId Update fehlgeschlagen:', e);
+        }
+    }
+
+    /**
+     * Snap-back-Schutz: nur wenn Lesestelle UNTER Session-Max gefallen ist (z. B. Repost)
+     * und ein konkurrierender Pfad wieder ÜBER Max springen will (z. B. GM-Sync → ChristophCanne).
+     * Promotion (oberster sichtbarer Post) bleibt ungeblockt.
+     */
+    function isBlockedByScrollUpMaxTweetId(candidate, referenceTweetId = null) {
+        if (!isScrollUpSessionActive() || !scrollState.scrollUpMaxTweetId || !candidate?.tweetId) {
+            return false;
+        }
+        const refId = referenceTweetId || lastReadPost?.tweetId;
+        if (!refId) return false;
+        try {
+            const candId = BigInt(candidate.tweetId);
+            const maxId = BigInt(scrollState.scrollUpMaxTweetId);
+            const refIdBig = BigInt(refId);
+            if (refIdBig < maxId && candId > maxId) {
+                debugLog('Save',
+                    `Hochscroll blockiert: @${candidate.authorHandler} ${candidate.tweetId}` +
+                    ` > Session-Max ${scrollState.scrollUpMaxTweetId}` +
+                    ` (Lesestelle ${refId} darunter)`);
+                return true;
+            }
+        } catch (e) {
+            debugLog('Save', 'Session-Max ID-Vergleich fehlgeschlagen:', e);
+        }
+        return false;
+    }
+
+    function isScrollUpPromotionCandidate(candidate, bookmark) {
+        if (!candidate?.tweetId || !bookmark?.tweetId) return false;
+        if (postRefKey(candidate) === postRefKey(bookmark)) return false;
+
+        const candidateKey = postRefKey(candidate);
+
+        // Landkarte/History-Gedächtnis: bekannte normale Posts beim Hochscrollen nicht
+        // erneut als Lesestelle promoten (tryPromote umging bisher markTopVisiblePost).
+        if (!candidate.isRepost && candidateKey && knownMarkedKeys.has(candidateKey)) {
+            debugLog('Save',
+                `Hochscroll-Promotion übersprungen: @${candidate.authorHandler} ${candidate.tweetId}` +
+                ' bereits in History/Landkarte');
+            return false;
+        }
+
+        // Session-Max: keine normalen Posts über dem Hochscroll-Höchststand (auch
+        // außerhalb isNearTimelineTop — marcfriedrich wurde dort noch promoted).
+        if (isScrollUpSessionActive() && !candidate.isRepost) {
+            try {
+                const maxRef = scrollState.scrollUpMaxTweetId;
+                if (maxRef && BigInt(candidate.tweetId) > BigInt(maxRef)) {
+                    debugLog('Save',
+                        'Hochscroll-Promotion übersprungen: @' +
+                        candidate.authorHandler, candidate.tweetId,
+                        '(über Session-Max', maxRef + ')');
+                    return false;
+                }
+            } catch (e) {
+                return false;
+            }
+        }
 
         try {
-            if (BigInt(newer.tweetId) <= BigInt(lastReadPost.tweetId)) return false;
+            if (BigInt(candidate.tweetId) > BigInt(bookmark.tweetId)) return true;
         } catch (e) {
             return false;
         }
+
+        return !!candidate.isRepost && isCandidateNewer(candidate, bookmark);
+    }
+
+    /** Nur der oberste sichtbare Post — kein Sprung zur höchsten Tweet-ID im Viewport. */
+    function findScrollUpPromotionCandidate(bookmark) {
+        if (!bookmark?.tweetId) return null;
+
+        const topEl = getTopVisiblePost();
+        if (!topEl) return null;
+        const topParsed = parseLoadedPost(topEl);
+        if (!topParsed?.tweetId || !topParsed.authorHandler || !topParsed.timestamp) return null;
+        if (!isScrollUpPromotionCandidate(topParsed, bookmark)) return null;
+
+        return topParsed;
+    }
+
+    function isAnchorTopVisiblePost(anchorPost) {
+        const topEl = getTopVisiblePost();
+        return !!(topEl && anchorPost && topEl === anchorPost);
+    }
+
+    function shouldAllowOlderRepostOnScrollUp(anchorPost, postTweetId, postTimestamp, repostFlag, mapDirection) {
+        if (!isScrollUpActive(mapDirection) || !repostFlag || !lastReadPost?.tweetId) return false;
+
+        const topEl = getTopVisiblePost();
+        if (!topEl || topEl !== anchorPost) return false;
+
+        return isCandidateNewer({
+            tweetId: postTweetId,
+            timestamp: postTimestamp,
+            isRepost: true,
+            readAt: new Date().toISOString()
+        }, lastReadPost);
+    }
+
+    /**
+     * Beim Hochscrollen: sichtbaren Post oberhalb der Lesestelle sofort markieren.
+     * Höhere Tweet-ID oder oberster Repost (ältere ID, frischer Feed-Eintrag).
+     */
+    async function tryPromoteNewerVisiblePostOnScrollUp(mapDirection) {
+        if (isLesestelleMutationBlocked()) return false;
+        if (newPostsState.restoreGraceUntil > Date.now()) return false;
+        if (!isScrollUpActive(mapDirection)) return false;
+        if (!lastReadPost?.tweetId) return false;
+
+        const newer = findScrollUpPromotionCandidate(lastReadPost);
+        if (!newer?.tweetId || !newer.authorHandler || !newer.timestamp) return false;
 
         const account = await getCurrentUserHandle();
         const nowIso = new Date().toISOString();
@@ -2218,14 +2390,22 @@
             context: captureReadingContext(newer.element)
         };
 
+        if (isLesestelleMutationBlocked() || newPostsState.restoreGraceUntil > Date.now()) {
+            debugLog('Save', 'Hochscroll-Promotion abgebrochen — New-Posts/Restore aktiv');
+            return false;
+        }
+
         invalidateHighlightRetries();
         lastReadPost = newPost;
         currentPost = newPost;
+        updateScrollUpMaxTweetId(newPost.tweetId);
         await saveLastReadPost(lastReadPost, { force: true });
         updateHighlightedPost(newer.element);
         applyHighlightToPost(newer.element);
-        log('Save', 'Hochscrollen: neuerer Post über Lesestelle markiert: @' + newer.authorHandler, newer.tweetId);
+        log('Save', 'Hochscrollen: Post über Lesestelle markiert: @' + newer.authorHandler, newer.tweetId,
+            newer.isRepost ? '(Repost)' : '');
         scrollState.hasScrolledUp = false;
+        scrollState.lastScrollUpPromoteAt = Date.now();
         return true;
     }
 
@@ -2257,6 +2437,9 @@
     }
 
     function getLesestelleAnchorPost() {
+        if (shouldSkipCompetingLesestelleSync()) {
+            return getTopVisiblePost();
+        }
         return getTopPostFromUpdatedMap();
     }
 
@@ -2457,6 +2640,7 @@
      */
     function reconcileLesestelleWithHistory() {
         if (isLesestelleMutationBlocked()) return;
+        if (shouldSkipCompetingLesestelleSync()) return;
         if (!lastReadPost || !lastReadPost.tweetId || postHistoryCache.length === 0) {
             return;
         }
@@ -2475,29 +2659,6 @@
             });
 
             if (exactPositionStillVisible) {
-                if (scrollState.hasScrolledUp || scrollState.lastMapScrollDirection === 'up') {
-                    const newerParsed = findNewestVisiblePostNewerThanBookmark(lastReadPost);
-                    if (newerParsed?.tweetId && newerParsed.authorHandler && newerParsed.timestamp) {
-                        try {
-                            if (BigInt(newerParsed.tweetId) > BigInt(lastReadPost.tweetId)) {
-                                lastReadPost = {
-                                    tweetId: newerParsed.tweetId,
-                                    timestamp: newerParsed.timestamp,
-                                    authorHandler: newerParsed.authorHandler,
-                                    isRepost: newerParsed.isRepost,
-                                    account: lastReadPost.account,
-                                    readAt: new Date().toISOString()
-                                };
-                                updateHighlightedPost(newerParsed.element);
-                                void saveLastReadPost(lastReadPost, { force: true });
-                                debugLog('Save', 'Gedächtnis-Abgleich: Neuerer Post beim Hochscrollen über Lesestelle');
-                                return;
-                            }
-                        } catch (e) {
-                            debugLog('Save', 'Hochscroll-Reconcile ID-Vergleich fehlgeschlagen:', e);
-                        }
-                    }
-                }
                 debugLog('Save', 'Reconcile übersprungen: Exakte aktuelle Lesestelle ist noch sichtbar (Option 2 Präferenz)');
                 syncHighlightIfDrifted();
                 return; // Nicht korrigieren, solange die echte aktuelle Position noch im Viewport ist
@@ -5163,6 +5324,52 @@
     return null;
 }
 
+    /** Viewport → Lesestelle vor New-Posts-Freeze (nur ohne Hochscroll-Phase). */
+    async function syncViewportLesestelleAtTimelineTopForNewPosts() {
+        if (!window.location.href.includes('/home')) return false;
+        if (!isNearTimelineTop() || isScrollUpSessionActive() || isScrollUpActive()) return false;
+
+        const topEl = getTopVisiblePost();
+        if (!topEl) return false;
+
+        const parsed = parseLoadedPost(topEl);
+        if (!parsed?.tweetId || !parsed.authorHandler || !parsed.timestamp) return false;
+        if (lastReadPost && postRefKey(parsed) === postRefKey(lastReadPost)) return false;
+        if (!isCandidateNewer(parsed, lastReadPost)) return false;
+
+        const parsedKey = postRefKey(parsed);
+        if (!parsed.isRepost && parsedKey && knownMarkedKeys.has(parsedKey)) {
+            debugLog('NewPosts',
+                `Freeze-Sync übersprungen: @${parsed.authorHandler} ${parsed.tweetId}` +
+                ' bereits in History/Landkarte');
+            return false;
+        }
+        if (lastReadPost?.isRepost && !parsed.isRepost) {
+            debugLog('NewPosts',
+                'Freeze-Sync übersprungen — Repost-Lesestelle bleibt (@' +
+                lastReadPost.authorHandler + ' ' + lastReadPost.tweetId + ')');
+            return false;
+        }
+
+        const account = await getCurrentUserHandle();
+        invalidateHighlightRetries();
+        lastReadPost = {
+            tweetId: parsed.tweetId,
+            timestamp: parsed.timestamp,
+            authorHandler: parsed.authorHandler,
+            isRepost: parsed.isRepost,
+            account,
+            readAt: new Date().toISOString(),
+            context: captureReadingContext(topEl)
+        };
+        await saveLastReadPost(lastReadPost);
+        updateHighlightedPost(topEl);
+        debugLog('NewPosts',
+            `Lesestelle vor Freeze aus Viewport: @${parsed.authorHandler} ${parsed.tweetId}` +
+            (parsed.isRepost ? ' (Repost)' : ''));
+        return true;
+    }
+
     async function ensureViewportLesestelleBeforeNewPosts() {
         if (searchControl.manualSearchActive) {
             debugLog('NewPosts', 'Lesestellen-Sync übersprungen — manuelle Suche aktiv.');
@@ -5170,7 +5377,12 @@
         }
         if (!window.location.href.includes('/home')) return true;
 
-        const anchorPost = getLesestelleAnchorPost();
+        if (isScrollUpSessionActive()) {
+            debugLog('NewPosts', 'Lesestellen-Sync übersprungen — Hochscroll-Session aktiv');
+            return true;
+        }
+
+        const anchorPost = getTopVisiblePost() || getLesestelleAnchorPost();
         if (!anchorPost) {
             log('NewPosts', 'Kein Post im Viewport – Neue Beiträge zurückgestellt');
             return false;
@@ -5207,14 +5419,15 @@
             isRepost: repostFlag
         };
 
+        if (isNearTimelineTop()) {
+            // Am Timeline-Ende: Hochscroll-Fortschritt nicht auf Map-/ID-Anker zurücksetzen.
+            debugLog('NewPosts',
+                `Am Timeline-Top: kein Lesestellen-Sync (@${authorHandler} ${tweetId}` +
+                `${repostFlag ? ', Repost' : ''} ≠ @${lastReadPost?.authorHandler} ${lastReadPost?.tweetId})`);
+            return true;
+        }
+
         if (lastReadPost?.tweetId && BigInt(tweetId) < BigInt(lastReadPost.tweetId)) {
-            // Am Timeline-Top ist ein älterer Viewport erwartbar (hochgescrollt, Lesestelle tiefer).
-            // Bookmark wird in clickNewPostsIndicator eingefroren — kein Sync, aber Laden erlauben.
-            if (isNearTimelineTop()) {
-                debugLog('NewPosts',
-                    `Viewport-Top (@${authorHandler} ${tweetId}) älter als Lesestelle (@${lastReadPost.authorHandler} ${lastReadPost.tweetId}) — am Top OK, Bookmark wird eingefroren.`);
-                return true;
-            }
             log('NewPosts', `Viewport-Top (@${authorHandler} ${tweetId}) ist älter als Lesestelle (@${lastReadPost.authorHandler} ${lastReadPost.tweetId}) — kein Auto-Laden/Restore.`);
             diagPush('BOOKMARK_OLDER_SKIPPED', 'warn',
                 'Viewport-Top ist älter als Lesestelle — kein Sync vor New-Posts', {
@@ -5279,6 +5492,12 @@
         return;
     }
 
+    if (isNearTimelineTop() && (isScrollUpSessionActive() || isScrollUpActive())) {
+        await tryPromoteNewerVisiblePostOnScrollUp('up');
+    } else if (isNearTimelineTop()) {
+        await syncViewportLesestelleAtTimelineTopForNewPosts();
+    }
+
     // Snapshot NACH Viewport-Sync: ensureViewport kann lastReadPost auf den
     // aktuell sichtbar-neuesten Post heben — ein früherer Snapshot würde sonst
     // nach New-Posts auf einen älteren Post zurückspringen (frozen ≠ live).
@@ -5326,6 +5545,10 @@
         baselineScrollHeight: document.body.scrollHeight || document.documentElement.scrollHeight,
     };
 
+    newPostsState.restoreGraceUntil = Date.now() + CONFIG.NEW_POSTS_GRACE_MS + 2500;
+    suppressionState.until = Date.now() + CONFIG.NEW_POSTS_GRACE_MS;
+    scrollState.hasScrolledUp = false;
+
     btn.dataset.processed = 'true';
     btn.click();
 
@@ -5333,8 +5556,6 @@
     debugLog('Restore', `Bookmark eingefroren für Restore: @${restoreBookmark.authorHandler} ${restoreBookmark.tweetId}`);
     newPostsState.autoLoadPaused = false;
     pendingNewPosts = 0;
-    suppressionState.until = Date.now() + CONFIG.NEW_POSTS_GRACE_MS;
-    scrollState.hasScrolledUp = false; // Nach Feed-Sprung durch "Neue Beiträge" kein automatisches Hochscrollen annehmen
 
     // === Wichtiger Pfad: Nach automatischem Laden neuer Beiträge die letzte Lesestelle wiederherstellen ===
     log('Restore', 'Nach neuen Beiträgen: Warte auf DOM-Stabilisierung und versuche letzte Lesestelle wiederherzustellen...');
@@ -5405,6 +5626,7 @@
                 scrollState.hasScrolledUp = false;
                 setTimeout(() => {
                     void reinstateFrozenReadingBookmark(restoreBookmark, { save: false });
+                    newPostsState.restoreGraceUntil = Date.now() + 1500;
                 }, 500);
             }
         }, 400);
